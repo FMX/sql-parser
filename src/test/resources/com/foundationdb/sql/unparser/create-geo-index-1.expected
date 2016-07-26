@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS idx1 ON table1(geo_lat_lon(c1, c2))

@@ -1,4 +1,0 @@
-com.akiban.sql.parser.DropSequenceNode@16bdb503
-name: test.bad_sequence
-statementType: DROP SEQUENCE bad_sequence
-existenceCheck: NO_CONDITION

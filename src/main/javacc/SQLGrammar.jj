@@ -1,4 +1,20 @@
 /**
+ * Copyright 2011-2013 FoundationDB, LLC
+ * 
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ * 
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ * 
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/**
  * SQL Parser Grammar.
  *
  * This grammar is derived from the one in Apache DB Derby (SVN revision 959991),
@@ -8,24 +24,7 @@
  * 
  */
 
-/**
- * Copyright © 2012 Akiban Technologies, Inc.  All rights
- * reserved.
- *
- * This program and the accompanying materials are made available
- * under the terms of the Eclipse Public License v1.0 which
- * accompanies this distribution, and is available at
- * http://www.eclipse.org/legal/epl-v10.html
- *
- * This program may also be available under different license terms.
- * For more information, see www.akiban.com or contact
- * licensing@akiban.com.
- *
- * Contributors:
- * Akiban Technologies, Inc.
- */
-
-/* The original from which this dervices bore the following: */
+/* The original from which this derives bore the following: */
 
 /*
 
@@ -70,14 +69,14 @@ options
 
 PARSER_BEGIN(SQLGrammar)
 
-package com.akiban.sql.parser;
+package com.foundationdb.sql.parser;
 
-import com.akiban.sql.StandardException;
-import com.akiban.sql.types.AliasInfo;
-import com.akiban.sql.types.RoutineAliasInfo;
-import com.akiban.sql.types.CharacterTypeAttributes;
-import com.akiban.sql.types.DataTypeDescriptor;
-import com.akiban.sql.types.TypeId;
+import com.foundationdb.sql.StandardException;
+import com.foundationdb.sql.types.AliasInfo;
+import com.foundationdb.sql.types.RoutineAliasInfo;
+import com.foundationdb.sql.types.CharacterTypeAttributes;
+import com.foundationdb.sql.types.DataTypeDescriptor;
+import com.foundationdb.sql.types.TypeId;
 
 import java.sql.ParameterMetaData;
 
@@ -167,11 +166,6 @@ class SQLGrammar
     public static final int DEFAULT_DECIMAL_SCALE = TypeId.DEFAULT_DECIMAL_SCALE;
     public static final int MAX_FLOATINGPOINT_LITERAL_LENGTH = 30;
 
-    /* Different kinds of string delimiters. */
-    static final String SINGLEQUOTES = "\'\'";
-    static final String DOUBLEQUOTES = "\"\"";
-    static final String BACKQUOTES = "``";
-
     // TODO: Probably not right.
     static final String IBM_SYSTEM_FUN_SCHEMA_NAME = "SYSFUN";
 
@@ -195,14 +189,17 @@ class SQLGrammar
     /* The statement being parsed. */
     private String statementSQLText;
 
+    /* Are parameter markers allowed? */
+
+    private boolean parametersAllowed;
+
     /* The number of the next ? parameter */
     private int parameterNumber;
 
     /* The list of ? parameters */
     private List<ParameterNode> parameterList;
 
-    /* Remember if the last identifier or keyword was a delimited identifier.
-         This is used for Java references. */
+    /* Remember if the last identifier or keyword was a delimited identifier. */
     private Boolean lastTokenDelimitedIdentifier = Boolean.FALSE,
                     nextToLastTokenDelimitedIdentifier = Boolean.FALSE;
 
@@ -218,7 +215,7 @@ class SQLGrammar
                                       length);
     }
 
-    private DataTypeDescriptor getJavaClassDataTypeDescriptor(TableName typeName) 
+    private DataTypeDescriptor getUserDataTypeDescriptor(TableName typeName)
             throws StandardException {
         return new DataTypeDescriptor(TypeId.getUserDefinedTypeId(typeName.getSchemaName(),
                                                                   typeName.getTableName(),
@@ -267,23 +264,126 @@ class SQLGrammar
      * Remove first and last quotes and compress adjacent ones in the
      * middle.
      */
-    // TODO: Need to support backslash escaping for compatible double-quoted string.
-    // TODO: This looks pretty inefficient.
-    private static String trimAndCompressQuotes(String source, String quotes, boolean backslash) {
-        String result = source.substring(1, source.length() - 1);
-
-        /* Find the first occurrence of adjacent quotes. */
-        int index = result.indexOf(quotes);
-
-        /* Replace each occurrence with a single quote and begin the
-         * search for the next occurrence from where we left off.
-         */
-        while (index != -1) {
-            result = result.substring(0, index + 1) + result.substring(index + 2);
-            index = result.indexOf(quotes, index + 1);
+    private static String trimAndCompressQuotes(String source, int pos, boolean backslash) throws StandardException {
+        char quote = source.charAt(pos-1);
+        int end = source.length() - 1;
+        assert (quote == source.charAt(end));
+        int qpos = source.indexOf(quote, pos);
+        if (qpos < 0) qpos = end;
+        if ((qpos == end) && (!backslash || (source.indexOf('\\', pos) < 0)))
+            // No other quotes, no relevant backslashes.
+            return source.substring(pos, end);
+        
+        StringBuilder result = new StringBuilder(end - 2);
+        
+        if (!backslash) {
+            while (true) {
+                result.append(source, pos, qpos);
+                if (qpos == end) break;
+                pos = qpos + 1;
+                if (source.charAt(pos) == quote) {
+                    result.append(quote);
+                    pos++;
+                }
+                qpos = source.indexOf(quote, pos);
+                if (qpos < 0) qpos = end;
+            }
+        }
+        else {
+            while (pos < end) {
+                char ch = source.charAt(pos++);
+                if (ch == quote) {
+                    if (source.charAt(pos) == quote) {
+                        result.append(quote);
+                        pos++;
+                    }
+                }
+                else if (ch == '\\') {
+                    ch = source.charAt(pos++);
+                    if (ch == 'b') {
+                        result.append('\b');
+                    }
+                    else if (ch == 'f') {
+                        result.append('\f');
+                    }
+                    else if (ch == 'n') {
+                        result.append('\n');
+                    }
+                    else if (ch == 'r') {
+                        result.append('\r');
+                    }
+                    else if (ch == 't') {
+                        result.append('\t');
+                    }
+                    else if ((ch >= '0') && (ch <= '7')) {
+                        if (pos + 2 > end)
+                            throw new StandardException("Octal escape requires three digits");
+                        int cp = Character.digit(ch, 8);
+                        for (int i = 0; i < 2; i++) {
+                            ch = source.charAt(pos++);
+                            int d = Character.digit(ch, 8);
+                            if (d < 0)
+                                throw new StandardException("Illegal octal escape");
+                            cp = (cp << 3) | d;
+                        }
+                        result.append((char)cp);
+                    }
+                    else if (ch == 'x') {
+                        if (pos + 2 > end)
+                            throw new StandardException("Hex escape requires two digits");
+                        int cp = 0;
+                        for (int i = 0; i < 2; i++) {
+                            ch = source.charAt(pos++);
+                            int d = Character.digit(ch, 16);
+                            if (d < 0)
+                                throw new StandardException("Illegal hex escape");
+                            cp = (cp << 4) | d;
+                        }
+                        result.append((char)cp);
+                    }
+                    else if (ch == 'u') {
+                        if (pos + 4 > end)
+                            throw new StandardException("Unicode escape requires four digits");
+                        int cp = 0;
+                        for (int i = 0; i < 4; i++) {
+                            ch = source.charAt(pos++);
+                            int d = Character.digit(ch, 16);
+                            if (d < 0)
+                                throw new StandardException("Illegal Unicode escape");
+                            cp = (cp << 4) | d;
+                        }
+                        result.append((char)cp);
+                    }
+                    else if (ch == 'U') {
+                        if (pos + 8 > end)
+                            throw new StandardException("Unicode escape requires eight digits");
+                        int cp = 0;
+                        for (int i = 0; i < 8; i++) {
+                            ch = source.charAt(pos++);
+                            int d = Character.digit(ch, 16);
+                            if (d < 0)
+                                throw new StandardException("Illegal Unicode escape");
+                            cp = (cp << 4) | d;
+                        }
+                        if (Character.charCount(cp) == 2) {
+                            result.append(Character.highSurrogate(cp));
+                            result.append(Character.lowSurrogate(cp));
+                        }
+                        else {
+                            result.append((char)cp);
+                        }
+                    }
+                    else {
+                        result.append(ch);
+                    }
+                }
+                else {
+                    result.append(ch);
+                }
+            }
         }
 
-        return result;
+        return result.toString();
     }
 
     private String sliceSQLText(int beginOffset, int endOffset, boolean trim) {
@@ -328,10 +428,7 @@ class SQLGrammar
      * Determine whether the next sequence of tokens can be the beginning
      * of an aggregateNode()() rule.    aggregateNodes() start with one
      * of the built-in aggregate names, or with an identifier followed
-     * by "( DISTINCT". A non-distinct user-defined aggregate invocation
-     * is treated as a staticMethodInvocationAlias() by the parser,
-     * and the binding phase figures out what it really is by looking
-     * at the data dictionary.
+     * by "( DISTINCT".
      *
      * We check only for the punctuation here, because identifiers are
      * very hard to check for in semantic lookahead.
@@ -476,6 +573,7 @@ class SQLGrammar
         case ABSVAL:
         case SQRT:
         case MOD:
+        case NULLIF:
         case COALESCE:
         case VALUE:
         case IDENTITY_VAL_LOCAL:
@@ -497,6 +595,8 @@ class SQLGrammar
         case CHAR:
         case VARCHAR:
         case INTEGER:
+        case MEDIUMINT:
+        case TINYINT:
         case INT:
         case SMALLINT:
         case LONGINT:
@@ -609,30 +709,14 @@ class SQLGrammar
 
         int tokKind = getToken(i).kind;
 
-        // check for integer literal or ? followed by ROW(S)
+        // check for integer literal or ?
         if (tokKind == PLUS_SIGN ||
             tokKind == MINUS_SIGN) {
 
             tokKind = getToken(++i).kind;
-
-            if (tokKind == EXACT_NUMERIC) {
-
-                tokKind = getToken(++i).kind;
-
-                return (tokKind == ROW ||
-                                tokKind == ROWS);
-            }
-        } 
-        else if (tokKind == EXACT_NUMERIC ||
-                 tokKind == QUESTION_MARK) {
-
-            tokKind = getToken(++i).kind;
-
-            return (tokKind == ROW ||
-                            tokKind == ROWS);
         }
-
-        return false;
+        return (tokKind == EXACT_NUMERIC ||
+                tokKind == QUESTION_MARK);
     }
 
     /**
@@ -674,7 +758,7 @@ class SQLGrammar
                 }
 
                 // (SELECT ... ) shouldn't be considered a row-constructor
-                if (tokKind == SELECT)
+                if (nesting == 1 && tokKind == SELECT)
                     return false;
 
                 // There must be a COMMA at nesting level 1 (i.e. outside of
@@ -709,97 +793,6 @@ class SQLGrammar
         return retval;
     }
 
-
-    /**
-     * Determine whether the next token is the beginning of a propertyList(). 
-     * A properties list is the comment "--derby-properties" followed by a 
-     * dot-separated list, followed by an =, followed by a value all on that 
-     * comment line. This means that the comment should start with the word
-     * "derby-properties".
-     *
-     * @return TRUE iff the next token is derby-properties 
-     */
-    private boolean derbyPropertiesListFollows() {
-        return getToken(1).kind == DERBYDASHPROPERTIES;
-    }
-
-    /**
-     * Determine whether the next sequence of tokens can be the beginning
-     * of a newInvocation(). A newInvocation() begins with the word "new"
-     * followed by a dot-separated list of identifiers, followed
-     * by a left parenthesis.
-     *
-     * @param startToken Token to look for new at
-     *
-     * @return TRUE iff the next set of tokens is the beginning of a newInvocation().
-     */
-    private boolean newInvocationFollows(int startToken) {
-        boolean retval = false;
-
-        // newInvocation() starts with the word "new"
-        if (getToken(startToken).kind == NEW) {
-            // Look at every other token. Ignore the identifiers, because
-            // they are hard to test for.
-            for (int i = 2 + startToken; true; i += 2) {
-                int tokKind = getToken(i).kind;
-
-                // If we find a left parenthesis without any intervening
-                // cruft, we have found a newInvocation()
-                if (tokKind == LEFT_PAREN) {
-                    retval = true;
-                    break;
-                }
-                else if (tokKind != PERIOD) {
-                    // Anything other than a PERIOD is "cruft"
-                    break;
-                }
-            }
-        }
-
-        return retval;
-    }
-
-    /**
-     * Determine whether the next sequence of tokens is a class name
-     *
-     * @return TRUE iff the next set of tokens is the Java class name
-     */
-    private boolean javaClassFollows() {
-        boolean retval = false;
-
-        // Look at every other token. Ignore the identifiers, because
-        // they are hard to test for.
-        for (int i = 2; true; i += 2) {
-            int tokKind = getToken(i).kind;
-
-            // If we find a '::' without any intervening
-            // cruft, we have found a javaClass
-            if (tokKind == DOUBLE_COLON) {
-                retval = true;
-                break;
-            }
-            else if (tokKind != PERIOD) {
-                // Anything other than a PERIOD is "cruft"
-                break;
-            }
-        }
-
-        return retval;
-    }
-
-    /**
-     * Determine whether the next sequence of tokens can be the beginning
-     * of a FROM newInvocation(). A FROM newInvocation() begins with the words "from new"
-     * followed by a dot-separated list of identifiers, followed
-     * by a left parenthesis.
-     *
-     * @return TRUE iff the next set of tokens is the beginning of a FROM newInvocation().
-     */
-    private boolean fromNewInvocationFollows() {
-        // FROM newInvocation() starts with the words "from new"
-        return (getToken(1).kind == FROM && newInvocationFollows(2));
-    }
-
     /**
      * Determine whether the next sequence of tokens can be the beginning
      * of a joinedTableExpression(). A joinedTableExpression() begins
@@ -810,6 +803,7 @@ class SQLGrammar
      *  CROSS JOIN
      *  LEFT OUTER JOIN
      *  RIGHT OUTER JOIN
+     *  FULL OUTER JOIN
      *  NATURAL [ { RIGHT | LEFT } [ OUTER ] | INNER ] JOIN
      *
      * @return TRUE iff the next set of tokens is the beginning of a joinedTableExpression().
@@ -832,12 +826,12 @@ class SQLGrammar
         else if (tokKind1 == NATURAL) {
             retval = true;
         }
-        else if ((tokKind1 == LEFT || tokKind1 == RIGHT) && tokKind2 == OUTER) {
+        else if ((tokKind1 == LEFT || tokKind1 == RIGHT || tokKind1 == FULL) && tokKind2 == OUTER) {
             if (getToken(3).kind == JOIN) {
                 retval = true;
             }
         }
-        else if ((tokKind1 == LEFT || tokKind1 == RIGHT) && tokKind2 == JOIN) {
+        else if ((tokKind1 == LEFT || tokKind1 == RIGHT || tokKind1 == FULL) && tokKind2 == JOIN) {
             retval = true;
         }
         else if (hasFeature(SQLParserFeature.MYSQL_HINTS) && tokKind1 == STRAIGHT_JOIN) {
@@ -1049,6 +1043,8 @@ class SQLGrammar
         case DECIMAL:
         case DEC:
         case INTEGER:
+        case MEDIUMINT:
+        case TINYINT:
         case INT:
         case SMALLINT:
         case LONGINT:
@@ -1062,11 +1058,19 @@ class SQLGrammar
         case BLOB:
         case CLOB:
         case NCLOB:
+        case TEXT:
+        case MEDIUMBLOB:
+        case MEDIUMTEXT:
+        case TINYBLOB:
+        case TINYTEXT:
+        case LONGBLOB:
+        case LONGTEXT:
         case BINARY: // LARGE OBJECT
         case XML:
         case INTERVAL:
         case DATETIME:
         case YEAR:
+        case GUID:
             retval = true;
             break;
 
@@ -1172,7 +1176,11 @@ class SQLGrammar
      *
      * @exception StandardException
      */
-    private ParameterNode makeParameterNode(int number) throws StandardException {
+    private ParameterNode makeParameterNode(int number, Token token) throws StandardException {
+        if (!parametersAllowed)
+            throw new StandardException("Parameters are not allowed");
+        if (number < 0)
+            throw new StandardException("Parameter indexes are positive");
         ParameterNode parm = (ParameterNode)
             nodeFactory.getNode(NodeTypes.PARAMETER_NODE,
                                 number,
@@ -1181,6 +1189,10 @@ class SQLGrammar
 
         if (parameterList != null)
             parameterList.add(parm);
+
+        parm.setBeginOffset(token.beginOffset);
+        parm.setEndOffset(token.endOffset);
+
         return parm;
     }
 
@@ -1412,7 +1424,8 @@ class SQLGrammar
      * @exception StandardException Thrown on error
      */
     StatementNode getCreateAliasNode(Object aliasName, String fullStaticMethodName,
-                                     Object aliasSpecificInfo, AliasInfo.Type aliasType)
+                                     Object aliasSpecificInfo, AliasInfo.Type aliasType,
+                                     Boolean createOrReplace)
             throws StandardException {
 
         StatementNode aliasNode = (StatementNode)
@@ -1420,6 +1433,7 @@ class SQLGrammar
                                            fullStaticMethodName,
                                            aliasSpecificInfo,
                                            aliasType,
+                                           createOrReplace,
                                            parserContext);
 
         return aliasNode;
@@ -1537,6 +1551,15 @@ class SQLGrammar
                                                  null,
                                                  parserContext);
 
+        case FULL_OUTER:
+            return (JoinNode)nodeFactory.getNode(NodeTypes.FULL_OUTER_JOIN_NODE,
+                                                 leftRSN,
+                                                 rightRSN,
+                                                 onClause,
+                                                 usingClause,
+                                                 null,
+                                                 parserContext);
+
         case STRAIGHT:
             {
                 Properties joinOrderStrategyProperties = new Properties();
@@ -1556,6 +1579,22 @@ class SQLGrammar
             assert false : "Unexpected joinType: " + joinType;
             return null;
         }
+    }
+
+    /**
+     * @param routineName TableName or String
+     */
+    private ValueNode newRoutineInvocationNode(Object routineName,
+                                               List<ValueNode> arguments) throws StandardException {
+        MethodCallNode methodNode = (MethodCallNode)nodeFactory.getNode(NodeTypes.STATIC_METHOD_CALL_NODE,
+                                                                        routineName,
+                                                                        null,
+                                                                        parserContext);
+
+        methodNode.addParms(arguments);
+        return (ValueNode)nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
+                                              methodNode,
+                                              parserContext);
     }
 
     // TODO: What is this about?
@@ -1590,6 +1629,11 @@ class SQLGrammar
         int kind2 = getToken(offset+1).kind;
         return (((kind1 == USE) || (kind1 == IGNORE) || (kind1 == FORCE)) &&
                 ((kind2 == INDEX) || (kind2 == KEY)));
+    }
+
+    boolean cacheHintFollows() {
+        return hasFeature(SQLParserFeature.MYSQL_HINTS) &&
+            ((getToken(1).kind == SQL_CACHE) || (getToken(1).kind == SQL_NO_CACHE));
     }
 
     boolean straightJoinFollows() {
@@ -1639,6 +1683,17 @@ class SQLGrammar
         case TILDE:
             return true;
         default:        
+            return false;
+        }
+    }
+
+    boolean unaryLogicalFollows() {
+        if (!hasFeature(SQLParserFeature.INFIX_NOT_OPERATOR))
+            return false;
+        switch(getToken(1).kind) {
+        case EXCLAMATION_MARK:
+            return true;
+        default:
             return false;
         }
     }
@@ -1764,8 +1819,9 @@ class SQLGrammar
                                  List<ParameterNode> parameterList)
             throws ParseException, StandardException {
         this.statementSQLText = statementSQLText;
-        this.parameterList = parameterList;
+        this.parametersAllowed = true;
         this.parameterNumber = 0;
+        this.parameterList = parameterList;
         return Statement();
     }
 
@@ -1773,6 +1829,7 @@ class SQLGrammar
             throws ParseException, StandardException {
         List<StatementNode> result = new ArrayList<StatementNode>();
         this.statementSQLText = statementSQLText;
+        this.parametersAllowed = false;
         StatementList(result);
         return result;
     }
@@ -1830,203 +1887,13 @@ MORE :
 }
 
 SKIP :
-{ /* comments */
-    "--" : IN_COMMENT
-}
-
-<IN_COMMENT> SKIP :
-{ /* white space */
-    " "
-| "\t"
-}
-
-    /* Check if the comment characters -- are followed by DERBY-PROPERTIES token. 
-     *
-     * If yes, then this comment is providing user-supplied optimizer
-     * overrides. There should be keyname=value [,keyname=value] pairs after
-     * -- DERBY-PROPERTIES otherwise throw an exception. These optimier
-     * overrides should be used in correct context only, otherwise, the
-     * parser will throw an exception.
-     *
-     * If this comment does not start with DERBY-PROPERTOIES, then it is just
-     * a regular comment. Skip the comment and move on to the next line.
-     */
-<IN_COMMENT> MORE [IGNORE_CASE]:
 {
-    "D" : LOOKFOR_DE
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_D : (~["D"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
+    "--" : IN_SINGLE_LINE_COMMENT
 }
 
-<LOOKFOR_DE> MORE [IGNORE_CASE]:
+<IN_SINGLE_LINE_COMMENT> SKIP :
 {
-    "E" : LOOKFOR_DER
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DE : (~["E"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DER> MORE [IGNORE_CASE]:
-{
-    "R" : LOOKFOR_DERB
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DER : (~["R"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERB> MORE [IGNORE_CASE]:
-{
-    "B" : LOOKFOR_DERBY
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERB : (~["B"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBY> MORE [IGNORE_CASE]:
-{
-    "Y" : LOOKFOR_DERBYDASH
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBY : (~["Y"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASH> MORE [IGNORE_CASE]:
-{
-    "-" : LOOKFOR_DERBYDASHP
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASH : (~["-"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHP> MORE [IGNORE_CASE]:
-{
-    "P" : LOOKFOR_DERBYDASHPR
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHP : (~["P"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPR> MORE [IGNORE_CASE]:
-{
-    "R" : LOOKFOR_DERBYDASHPRO
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHPR : (~["R"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPRO> MORE [IGNORE_CASE]:
-{
-    "O" : LOOKFOR_DERBYDASHPROP
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHPRO : (~["O"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPROP> MORE [IGNORE_CASE]:
-{
-    "P" : LOOKFOR_DERBYDASHPROPE
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHPROP : (~["P"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPROPE> MORE [IGNORE_CASE]:
-{
-    "E" : LOOKFOR_DERBYDASHPROPER
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHPROPE : (~["E"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPROPER> MORE [IGNORE_CASE]:
-{
-    "R" : LOOKFOR_DERBYDASHPROPERT
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHPROPER : (~["R"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPROPERT> MORE [IGNORE_CASE]:
-{
-    "T" : LOOKFOR_DERBYDASHPROPERTI
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHPROPERT : (~["T"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPROPERTI> MORE [IGNORE_CASE]:
-{
-    "I" : LOOKFOR_DERBYDASHPROPERTIE
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHPROPERTI : (~["I"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPROPERTIE> MORE [IGNORE_CASE]:
-{
-    "E" : LOOKFOR_DERBYDASHPROPERTIES
-|
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_DERBYDASHPROPERTIE : (~["E"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<LOOKFOR_DERBYDASHPROPERTIES> TOKEN [IGNORE_CASE] :
-{        
-    <DERBYDASHPROPERTIES : "DERBYDASHPROPERTIES"> 
-}
-
-    /*
-     * Once we find comment starting with -- DERBY-PROPERTIES, we want
-     * to switch from SKIP mode to the TOKEN mode in the parser so the
-     * rest of the characters on the comment line can be treated as part
-     * of one big token so we can get keyname=value pairs from that
-     * token. The reason for treating them as one big token is that the
-     * existing code in parser allows newline characters between
-     * individual token but with optimizer overrides, all the properties
-     * have to be specified on the -- DERBY-PROPERTIES comment line.
-     */
-<LOOKFOR_DERBYDASHPROPERTIES> TOKEN [IGNORE_CASE]:
-{
-    "S" { matchedToken.kind = DERBYDASHPROPERTIES; } : PROPERTIES_LIST
-}
-
-// We found -- DERBY-PROPERTIE? where ? is a character other than S
-// and hence we should the rest of the characters on this line as a
-// regular comment
-<LOOKFOR_DERBYDASHPROPERTIES> SKIP :
-{
-    <("\n"|"\r"|"\r\n")?> : DEFAULT
-|
-    <NOT_PROPERTIES : (~["S","s"])> : IT_IS_NOT_DERBYPROPERTIES_COMMENT
-}
-
-<IT_IS_NOT_DERBYPROPERTIES_COMMENT> SKIP :
-{
-    <SINGLE_LINE_SQLCOMMENT: (~["\n","\r"])* ("\n"|"\r"|"\r\n")?> : DEFAULT
-}
-
-// Found -- DERBY-PROPERTIES. 
-// Treat rest of the characters on the line as one big token and then
-// fetch keyname=value pairs from that token.
-<PROPERTIES_LIST> TOKEN :
-{
-    <CHECK_PROPERTIES: (~["\n","\r"])* ("\n"|"\r"|"\r\n")?> : DEFAULT
+    <(~["\n","\r"])* ("\n"|"\r"|"\r\n")?> : DEFAULT
 }
 
 /* This list should contain only and all SQL92 keywords that are
@@ -2036,7 +1903,6 @@ SKIP :
 /* LOCAL is not a reserved word as most other databases do not enforce it. 
  * LOCAL is not used at all in this grammar.
  */
-// NOTE: If you add a keyword, then you must add it to reservedKeyword() as well.
 TOKEN [IGNORE_CASE] :
 { /* SQL92 reserved Keywords */
   <ADD: "add">
@@ -2185,6 +2051,7 @@ TOKEN [IGNORE_CASE] :
 | <OVERLAPS: "overlaps">
 | <PAD: "pad">
 | <PARTIAL: "partial">
+| <PARTITION: "partition">
 | <PREPARE: "prepare">
 | <PRESERVE: "preserve">
 | <PRIMARY: "primary">
@@ -2251,7 +2118,6 @@ TOKEN [IGNORE_CASE] :
 | <WORK: "work">
 | <WRITE: "write">
 | <YEAR: "year">
-| <Z_ORDER_LAT_LON: "z_order_lat_lon">
 }
 
 /* This list should contain only and all SQL92 keywords that are
@@ -2360,10 +2226,10 @@ TOKEN [IGNORE_CASE] :
  * reserved words to comply with the SQL/XML (2003) standard, section
  * 5.1.  Similarly, XMLQUERY is a reserved word per SQL/XML (2006).
  */
-// NOTE: If you add a keyword, then you must add it to reservedKeyword() as well.
 TOKEN [IGNORE_CASE] :
 { /* Additional non-SQL92 reserved keywords */
-  <BOOLEAN: "boolean">
+  <ATOMIC: "atomic"> /* reserved word in 2011 spec */
+| <BOOLEAN: "boolean">
 | <CALL: "call">
 | <CURDATE: "curdate">
 | <CURRENT_ROLE: "current_role">
@@ -2374,7 +2240,6 @@ TOKEN [IGNORE_CASE] :
 | <GROUPING: "grouping">
 | <EXPLAIN: "explain">
 | <LIMIT: "limit">
-| <LONGINT: "bigint">
 | <LONG: "long">
 | <LTRIM: "ltrim">
 | <NONE: "none">
@@ -2383,6 +2248,8 @@ TOKEN [IGNORE_CASE] :
 | <ROLE: "role">
 | <ROWNUMBER: "row_number">
 | <RTRIM: "rtrim">
+| <SQL_CACHE: "sql_cache">
+| <SQL_NO_CACHE: "sql_no_cache">
 | <STRAIGHT_JOIN: "straight_join">
 | <SUBSTR:  "substr">
 | <XML:  "xml">
@@ -2407,7 +2274,6 @@ TOKEN [IGNORE_CASE] :
   <AFTER: "after">
 | <BEFORE: "before">
 | <BRIEF: "brief">
-| <BTREE: "btree">
 | <CLASS: "class">
 | <COMPRESS: "compress">
 | <CONTENT: "content">
@@ -2419,7 +2285,6 @@ TOKEN [IGNORE_CASE] :
 | <DAY_MICROSECOND: "day_microsecond">
 | <DAY_MINUTE: "day_minute">
 | <DAY_SECOND: "day_second">
-| <DB2SQL: "db2sql">
 | <DEFRAGMENT: "defragment">
 | <DELIMITER: "delimiter">
 | <DIRTY: "dirty">
@@ -2431,12 +2296,14 @@ TOKEN [IGNORE_CASE] :
 | <FN: "fn">
 | <FORCE: "force">
 | <FORMAT: "format">
+| <FULL_TEXT: "full_text">
+| <GUID: "guid">
 | <HEADER: "header">
 | <HOUR_MICROSECOND: "hour_microsecond">
 | <HOUR_MINUTE: "hour_minute">
 | <HOUR_SECOND: "hour_second">
+| <INSTEAD: "instead"> /* added in 2011 non-reserved */
 | <IGNORE: "ignore">
-| <IN_MEMORY: "in_memory">
 | <INPLACE: "inplace">
 | <INTERRUPT: "interrupt">
 | <JAVA: "java">
@@ -2444,6 +2311,12 @@ TOKEN [IGNORE_CASE] :
 | <LCASE: "lcase">
 | <LOCATE: "locate">
 | <LOCK: "lock">
+| <LONGBLOB: "longblob">
+| <LONGINT: "bigint">
+| <LONGTEXT: "longtext">
+| <MEDIUMBLOB: "mediumblob">
+| <MEDIUMINT: "mediumint">
+| <MEDIUMTEXT: "mediumtext">
 | <MESSAGE_LOCALE: "message_locale">
 | <METHOD: "method">
 | <MICROSECOND: "microsecond">
@@ -2469,9 +2342,11 @@ TOKEN [IGNORE_CASE] :
 | <REF: "ref">
 | <REFERENCING: "referencing">
 | <RENAME: "rename">
+| <REPLACE: "replace">
 | <RESET: "reset">
 | <RESULT: "result">
 | <RETAIN: "retain">
+| <RETRY: "retry">
 | <RR: "rr">
 | <RS: "rs">
 | <SECOND_MICROSECOND: "second_microsecond">
@@ -2480,7 +2355,10 @@ TOKEN [IGNORE_CASE] :
 | <SEQUENTIAL: "sequential">
 | <SETS: "sets">
 | <SHARE: "share">
+| <SHOW: "show">
 | <SHUTDOWN: "shutdown">
+| <SIMPLE: "simple">
+| <SNAPSHOT: "snapshot">
 | <SPECIFIC: "specific">
 | <SQLID: "sqlid">
 | <SQRT: "sqrt">
@@ -2488,8 +2366,13 @@ TOKEN [IGNORE_CASE] :
 | <STATISTICS: "statistics">
 | <STDIN: "stdin">
 | <STDOUT: "stdout">
+| <STORAGE_FORMAT: "storage_format">
 | <STRIP: "strip">
 | <STYLE: "style">
+| <TEXT:  "text">
+| <TINYBLOB: "tinyblob">
+| <TINYINT: "tinyint">
+| <TINYTEXT: "tinytext">
 | <TRIGGER: "trigger">
 | <TRUNCATE_END: "truncate_end">
 | <UCASE: "ucase">
@@ -2520,8 +2403,6 @@ TOKEN :
 | <MINUS_SIGN: "-">
 | <PERIOD: ".">
 | <SOLIDUS: "/">
-| <COLON: ":">
-| <DOUBLE_COLON: "::">
 | <SEMICOLON: ";">
 | <LESS_THAN_OPERATOR: "<">
 | <LESS_THAN_OR_EQUALS_OPERATOR: "<=">
@@ -2538,6 +2419,7 @@ TOKEN :
 | <DOUBLE_GREATER: ">>">
 | <FIELD_REFERENCE: "->">
 | <ASTERISK_ASTERISK: "**">
+| <EXCLAMATION_MARK: "!">
 }
 
 TOKEN :
@@ -2552,12 +2434,17 @@ TOKEN :
 
 TOKEN :
 { /* Identifiers */
- <IDENTIFIER: ( <LETTER> ) (<LETTER> | "_" | <DIGIT>)* >
+ <IDENTIFIER: ( <LETTER> | "_" ) (<LETTER> | "_" | <DIGIT> | <DOLLAR> )* >
 }
 
 TOKEN :
 { /* Postgres-style parameters */
  <DOLLAR_N: ( "$" (<DIGIT>)+ ) >
+}
+
+TOKEN : 
+{
+    <DOLLAR: ("$") >
 }
 
 // TODO: These are not used. Are they necessary to bare use work?
@@ -2843,6 +2730,22 @@ MORE :
     "\""> : DEFAULT
 }
 
+MORE [IGNORE_CASE] :
+{
+  "E'" : IN_ESCAPEQUOTED_STRING
+}
+
+<IN_ESCAPEQUOTED_STRING> TOKEN :
+{
+  <ESCAPEQUOTED_STRING:
+    (
+      ("''") |
+      ("\\" ["\u0001" - "\uffdc"]) |
+      (~["'", "\\"])
+    ) +
+    "'"> : DEFAULT
+}
+
 MORE :
 {
   "$$" : IN_DOUBLEDOLLAR_STRING
@@ -3014,6 +2917,8 @@ StatementPart(Token[] tokenHolder) throws StandardException :
     statementNode = transactionControlStatement()
 |
     statementNode = copyStatement()
+|
+    statementNode = showStatement()
 )
     {
         return statementNode;
@@ -3021,7 +2926,7 @@ StatementPart(Token[] tokenHolder) throws StandardException :
 }
 
 ExistenceCheck
-createCondition() throws StandardException :
+notExistsCondition() throws StandardException :
 {
 }
 {
@@ -3038,7 +2943,7 @@ createCondition() throws StandardException :
 }
 
 ExistenceCheck
-dropCondition() throws StandardException :
+existsCondition() throws StandardException :
 {
 }
 {
@@ -3059,9 +2964,17 @@ createStatements() throws StandardException :
 {
     StatementNode statementNode;
     Token beginToken;
+    Boolean createOrReplace = Boolean.FALSE;
 }
 {
     beginToken = <CREATE> 
+    [ LOOKAHEAD ( { getToken(1).kind == OR &&
+                    getToken(2).kind == REPLACE &&
+                  ( getToken(3).kind == SYNONYM || 
+                    getToken(3).kind == PROCEDURE ||
+                    getToken(3).kind == FUNCTION ||
+                    getToken(3).kind == TYPE ) })
+      <OR> <REPLACE> { createOrReplace = Boolean.TRUE; } ]
 (
     statementNode = schemaDefinition() 
 |
@@ -3069,7 +2982,7 @@ createStatements() throws StandardException :
 |
     statementNode = triggerDefinition()
 |
-    statementNode = synonymDefinition() 
+    statementNode = synonymDefinition(createOrReplace) 
 |
     statementNode = roleDefinition() 
 |
@@ -3077,11 +2990,11 @@ createStatements() throws StandardException :
 |
     statementNode = tableDefinition()
 |
-    statementNode = procedureDefinition()
+    statementNode = procedureDefinition(createOrReplace)
 |        
-    statementNode = functionDefinition()
+    statementNode = functionDefinition(createOrReplace)
 |
-    statementNode = udtDefinition()
+    statementNode = udtDefinition(createOrReplace)
 |
     statementNode = indexDefinition()
 )
@@ -3155,6 +3068,8 @@ spsSetStatement() throws StandardException :
     |
         statementNode = setTransactionStatement()
     |
+        statementNode = setConstraintsStatement()
+    |
         statementNode = setConfigurationStatement()
     )
     {
@@ -3222,40 +3137,22 @@ preparableDeleteStatement() throws StandardException :
 StatementNode
 deleteBody() throws StandardException :
 {
-    JavaToSQLValueNode javaToSQLNode = null;
     String correlationName = null;
     TableName tableName = null;
     ValueNode whereClause = null;
     FromTable fromTable = null;
     QueryTreeNode retval;
-    Properties targetProperties = null;
     Token whereToken = null;
     ResultColumnList returningList = null;
 }
 {
-    LOOKAHEAD( { fromNewInvocationFollows() } )
-    <FROM> javaToSQLNode = newInvocation()
-    [ whereToken = <WHERE> whereClause = whereClause(whereToken) ]
-    {
-        fromTable = (FromTable)nodeFactory.getNode(NodeTypes.FROM_VTI,
-                                                   javaToSQLNode.getJavaValueNode(),
-                                                   (String)null,
-                                                   null,
-                                                   (Properties)null,
-                                                   parserContext); 
-
-        return getDeleteNode(fromTable, tableName, whereClause, returningList);
-    }
-|
     <FROM> tableName = qualifiedName() 
     [ 
         LOOKAHEAD( { (getToken(1).kind != EOF) && (getToken(1).kind != SEMICOLON) && 
         		(getToken(1).kind != WHERE) &&
-        		(getToken(1).kind != RETURNING) &&  
-                                     !derbyPropertiesListFollows() } )
+        		(getToken(1).kind != RETURNING) } )
         [ <AS> ] correlationName = identifier() 
     ]
-    [ targetProperties = propertyList(false) <CHECK_PROPERTIES> ]
     [ 
         whereToken = <WHERE>
         (
@@ -3284,10 +3181,6 @@ deleteBody() throws StandardException :
                                                        correlationName,
                                                        FromBaseTable.UpdateOrDelete.DELETE,
                                                        parserContext);
-
-        if (targetProperties != null) {
-            ((FromBaseTable)fromTable).setTableProperties(targetProperties);
-        }
 
         return getDeleteNode(fromTable, tableName, whereClause, returningList);
     }
@@ -3376,22 +3269,9 @@ insertStatement() throws StandardException :
 QueryTreeNode
 targetTable() throws StandardException :
 {
-    JavaToSQLValueNode javaToSQLNode;
     TableName tableName;
 }
 {
-    // NOTE: this rule has to come first in order to avoid making NEW a reserved word.
-    LOOKAHEAD( { newInvocationFollows(1) } )
-    javaToSQLNode = newInvocation()
-    {
-        return nodeFactory.getNode(NodeTypes.FROM_VTI,
-                                   javaToSQLNode.getJavaValueNode(),
-                                   null,
-                                   null,
-                                   (Properties)null,
-                                   parserContext); 
-    }
-|
     tableName = qualifiedName() 
     {
         return tableName;
@@ -3415,36 +3295,18 @@ updateBody() throws StandardException :
 {
     ResultColumnList columnList;
     String correlationName = null;
-    JavaToSQLValueNode javaToSQLNode = null;
     TableName tableName = null;
     ValueNode whereClause = null;
     FromTable fromTable = null;
-    Properties targetProperties = null;
     Token whereToken = null;
     ResultColumnList returningList = null;
 }
 {
-    LOOKAHEAD( { newInvocationFollows(1) } ) 
-    javaToSQLNode = newInvocation()
-    <SET> columnList = setClauseList()
-    [ whereToken = <WHERE> whereClause = whereClause(whereToken) ]
-    {
-        fromTable = (FromTable)nodeFactory.getNode(NodeTypes.FROM_VTI,
-                                                   javaToSQLNode.getJavaValueNode(),
-                                                   (String)null,
-                                                   null,
-                                                   (Properties)null,
-                                                   parserContext); 
-
-        return getUpdateNode(fromTable, tableName, columnList, whereClause, returningList);
-    }
-|
     tableName = qualifiedName()
     [
-        LOOKAHEAD( { (getToken(1).kind != SET) && !derbyPropertiesListFollows() } )
+        LOOKAHEAD( { (getToken(1).kind != SET) } )
         [ <AS> ] correlationName = identifier() 
     ]
-    [ targetProperties = propertyList(false) <CHECK_PROPERTIES> ] 
     <SET> columnList = setClauseList()
     [ 
         whereToken = <WHERE>
@@ -3473,9 +3335,6 @@ updateBody() throws StandardException :
                                                        FromBaseTable.UpdateOrDelete.UPDATE,
                                                        parserContext);
 
-        if (targetProperties != null) {
-            ((FromBaseTable)fromTable).setTableProperties(targetProperties);
-        }
         return getUpdateNode(fromTable, tableName, columnList, whereClause, returningList);
     }
 }
@@ -3572,7 +3431,7 @@ ValueNode primaryExpression() throws StandardException :
         return value;
     }
 |
-    value = primaryExpressionXX()
+    value = primary()
     {
         return value;
     }
@@ -3705,7 +3564,6 @@ globalTemporaryTableDeclaration() throws StandardException :
         return (StatementNode)nodeFactory.getNode(NodeTypes.CREATE_TABLE_NODE,
                                                   tableName,
                                                   tableElementList,
-                                                  (Properties)null,
                                                   (Boolean)declareTableClauses[1],
                                                   (Boolean)declareTableClauses[2],
                                                   parserContext);
@@ -3784,10 +3642,9 @@ tableElement(TableElementList tableElementList) throws StandardException :
 {
 }
 {
-    columnDefinition(tableElementList) | tableConstraintDefinition(tableElementList)
-    {
-        return ;
-    }
+      columnDefinition(tableElementList)
+    | tableConstraintDefinition(tableElementList)
+    | tableIndexDefinition(false, tableElementList)
 }
 
 boolean
@@ -3861,7 +3718,7 @@ dataTypeDDL() throws StandardException :
     }
 |
     LOOKAHEAD ( { getToken(1).kind != GENERATED } )
-    typeDescriptor = javaType()
+    typeDescriptor = userDataType()
     {
         return typeDescriptor;
     }
@@ -3893,7 +3750,7 @@ dataTypeCast() throws StandardException :
         return typeDescriptor;
     }
 |
-    typeDescriptor = javaType()
+    typeDescriptor = userDataType()
     {
         return typeDescriptor;
     }
@@ -3929,6 +3786,11 @@ dataTypeCommon() throws StandardException :
     <BOOLEAN>
     {
         typeDescriptor = new DataTypeDescriptor(TypeId.BOOLEAN_ID, true);
+    }
+|
+    <GUID>
+    {
+        typeDescriptor = new DataTypeDescriptor(TypeId.GUID_ID, true);
     }
 |
     typeDescriptor = longType()
@@ -4076,7 +3938,8 @@ characterTypeAttributes()  throws StandardException :
     CharacterTypeAttributes characterAttributes = null;
 }
 {
-    [ <CHARACTER> <SET> characterSet = qualifiedName() { characterAttributes = CharacterTypeAttributes.forCharacterSet(characterSet.toString()); } ]
+    [ LOOKAHEAD( { getToken(2).kind == SET } )
+      <CHARACTER> <SET> characterSet = qualifiedName() { characterAttributes = CharacterTypeAttributes.forCharacterSet(characterSet.toString()); } ]
     [ collation = collateClause() { characterAttributes = CharacterTypeAttributes.forCollation(characterAttributes, collation); } ]
     {
         return characterAttributes;
@@ -4088,6 +3951,7 @@ LOBType() throws StandardException :
 {
     int length = 0x80000000-1;      // default to 2GB-1 if no length specified
     String type;
+    CharacterTypeAttributes characterAttributes;
 }
 {
 (
@@ -4099,6 +3963,11 @@ LOBType() throws StandardException :
     <CLOB> [ length = lengthAndModifier() ]
     {
         type = TypeId.CLOB_NAME;
+    }
+|
+    <TEXT> [ length = lengthAndModifier() ]
+    {
+        type = TypeId.TEXT_NAME;
     }
 |
     <NCLOB> length = lengthAndModifier()
@@ -4120,9 +3989,42 @@ LOBType() throws StandardException :
     {
         type = TypeId.NCLOB_NAME;
     }
+|
+    <TINYBLOB> [ length = lengthAndModifier() ]
+    {
+        type = TypeId.TINYBLOB_NAME;
+    }
+|
+    <TINYTEXT> [ length = lengthAndModifier() ]
+    {
+        type = TypeId.TINYTEXT_NAME;
+    }
+|
+    <MEDIUMBLOB> [ length = lengthAndModifier() ]
+    {
+        type = TypeId.MEDIUMBLOB_NAME;
+    }
+|
+    <MEDIUMTEXT> [ length = lengthAndModifier() ]
+    {
+        type = TypeId.MEDIUMTEXT_NAME;
+    }
+|
+    <LONGBLOB> [ length = lengthAndModifier() ]
+    {
+        type = TypeId.LONGBLOB_NAME;
+    }
+|
+    <LONGTEXT> [ length = lengthAndModifier() ]
+    {
+        type = TypeId.LONGTEXT_NAME;
+    }
 )
+    characterAttributes = characterTypeAttributes()
     {
         DataTypeDescriptor dtd = DataTypeDescriptor.getBuiltInDataTypeDescriptor(type, length);
+        if (characterAttributes != null)
+            dtd = new DataTypeDescriptor(dtd, characterAttributes);
         return dtd;
     }
 }
@@ -4207,6 +4109,16 @@ exactIntegerType() throws StandardException :
     ( <INTEGER> | <INT> )
     {
         return DataTypeDescriptor.getBuiltInDataTypeDescriptor(Types.INTEGER);
+    }
+|
+    <MEDIUMINT>
+    {
+        return DataTypeDescriptor.MEDIUMINT;
+    }
+|
+    <TINYINT>
+    {
+        return DataTypeDescriptor.getBuiltInDataTypeDescriptor(Types.TINYINT);
     }
 |
     <SMALLINT>
@@ -4358,52 +4270,14 @@ xmlDocOrContent() throws StandardException :
 }
 
 DataTypeDescriptor
-javaType() throws StandardException :
+userDataType() throws StandardException :
 {
     TableName typeName;
 }
 {
     typeName = qualifiedName()
     {
-        return getJavaClassDataTypeDescriptor(typeName);
-    }
-}
-
-// A Java dot-separated list.
-String
-javaDSL() :
-{
-    String dotSeparatedList;
-}
-{
-    dotSeparatedList = caseSensitiveIdentifierPlusReservedWords()
-        ( dotSeparatedList = javaDSLNameExtender(dotSeparatedList) )*
-    {
-        return dotSeparatedList;
-    }
-}
-
-String
-javaClassName() :
-{
-    String javaClassName;
-}
-{
-    javaClassName = javaDSL()
-    {
-        return javaClassName;
-    }
-}
-
-String
-javaDSLNameExtender(String dotSeparatedList)    :
-{
-    String extender;
-}
-{
-    <PERIOD> extender = caseSensitiveIdentifierPlusReservedWords()
-    {
-        return dotSeparatedList + "." + extender;
+        return getUserDataTypeDescriptor(typeName);
     }
 }
 
@@ -4712,16 +4586,22 @@ intervalNonSecond() throws StandardException :
 
 
 
-void
-qualifiedNameList(List<TableName> list) throws StandardException :
-{}
+TableNameList
+qualifiedNameList() throws StandardException :
+{
+    TableNameList list = (TableNameList)
+        nodeFactory.getNode(NodeTypes.TABLE_NAME_LIST, parserContext);
+}
 {
     qualifiedNameElement(list) 
     ( <COMMA> qualifiedNameElement(list) )*
+    {
+        return list;
+    }
 }
 
 void 
-qualifiedNameElement(List<TableName> list) throws StandardException :
+qualifiedNameElement(TableNameList list) throws StandardException :
 {
     TableName qualifiedName = null;
 }
@@ -4971,6 +4851,7 @@ querySpecification() throws StandardException :
     SelectNode selectNode;
     boolean isDistinct = false;
     Token straightJoin = null;
+    Boolean cacheHint = null;
 }
 {
     <SELECT> 
@@ -4979,11 +4860,14 @@ querySpecification() throws StandardException :
     [ isDistinct = setQuantifier() ]
     [ LOOKAHEAD( { (straightJoin == null) && straightJoinFollows() } )
       straightJoin = <STRAIGHT_JOIN> ]
+    [ LOOKAHEAD( { cacheHintFollows() } )
+      cacheHint = cacheHint() ]
     selectList = selectList()
     selectNode = tableExpression(selectList)
     {
         if (isDistinct) selectNode.makeDistinct();
         if (straightJoin != null) selectNode.makeStraightJoin();
+        if (cacheHint != null) selectNode.setCacheHint(cacheHint);
         return selectNode;
     }
 }
@@ -4992,21 +4876,28 @@ boolean
 setQuantifier() :
 {}
 {
-    // This LOOKAHEAD is required to distinquish distinct from a class
-    // which starts with distinct (e.g., distinct::).
-    LOOKAHEAD( { getToken(1).kind == DISTINCT &&
-                                 !(getToken(2).kind == PERIOD || getToken(2).kind == DOUBLE_COLON) } )
     <DISTINCT>
     {
         forbidNextValueFor();
         return true;
     }
 |
-    // This LOOKAHEAD is required to distinquish all from a class which
-    // starts with all (e.g., all::).
-    LOOKAHEAD( { getToken(1).kind == ALL &&
-                                 !(getToken(2).kind == PERIOD || getToken(2).kind == DOUBLE_COLON) } )
     <ALL>
+    {
+        return false;
+    }
+}
+
+boolean
+cacheHint() :
+{}
+{
+    <SQL_CACHE>
+    {
+        return true;
+    }
+|
+    <SQL_NO_CACHE>
     {
         return false;
     }
@@ -5156,9 +5047,7 @@ andExpression(ValueNode farLeftOperand) throws StandardException :
     ValueNode test;
 }
 {
-    // This LOOKAHEAD is required to tell that NOT is not part of a class name.
-    [ LOOKAHEAD( { getToken(1).kind == NOT && 
-                                     !(getToken(2).kind == PERIOD || getToken(2).kind == DOUBLE_COLON) } )
+    [ LOOKAHEAD( { getToken(1).kind == NOT } )
         notToken = <NOT> ]
     test = isSearchCondition() 
     {
@@ -5316,7 +5205,6 @@ remainingNonNegatablePredicate(ValueNode leftOperand) throws StandardException :
 {
     BinaryOperatorNode.OperatorType operator;
     SubqueryNode.SubqueryType subqueryType;
-    String javaClassName;
     Token tok = null;
     ValueNode tree = null;
     ValueNode likePattern;
@@ -5651,6 +5539,9 @@ unaryExpression(ValueNode farLeftOperand,
     |
         LOOKAHEAD( { unaryBitFollows() })
         sign = unaryBitOperator()
+    |
+        LOOKAHEAD( { unaryLogicalFollows() } )
+        sign = unaryLogicalOperator()
     )
     ]
     value = primaryExpression()
@@ -5667,6 +5558,11 @@ unaryExpression(ValueNode farLeftOperand,
         }
         else if ("~".equals(sign)) {
             value = (ValueNode)nodeFactory.getNode(NodeTypes.UNARY_BITNOT_OPERATOR_NODE,
+                                                   value,
+                                                   parserContext);
+        }
+        else if ("!".equals(sign)) {
+            value = (ValueNode)nodeFactory.getNode(NodeTypes.NOT_NODE,
                                                    value,
                                                    parserContext);
         }
@@ -5706,127 +5602,15 @@ unaryBitOperator() :
     }
 }
 
-ValueNode
-primaryExpressionXX() throws StandardException :
+String
+unaryLogicalOperator() :
 {
-    ValueNode value;
+    Token s;
 }
 {
-    value = primary()
-    ( value = nonStaticMethodCallOrFieldAccess(value) )*    
+    s = <EXCLAMATION_MARK>
     {
-        return value;
-    }
-}
-
-ValueNode
-nonStaticMethodCallOrFieldAccess(ValueNode receiver) throws StandardException :
-{
-    ValueNode value;
-}
-{
-    value = nonStaticMethodInvocation(receiver)
-    {
-        return value;
-    }
-}
-
-ValueNode
-nonStaticMethodInvocation(ValueNode receiver) throws StandardException :
-{
-    List<ValueNode> parameterList = new ArrayList<ValueNode>();
-    MethodCallNode methodNode;
-    ParameterNode parameterNode;
-}
-{
-    LOOKAHEAD( { getToken(3).kind == LEFT_PAREN } )
-    ( <FIELD_REFERENCE> | <PERIOD> )
-    methodNode = methodName(receiver) 
-    methodCallParameterList(parameterList)
-    {
-        /*
-        ** ? parameters are not allowed for the receiver --
-        ** unless the receiver is standing in for a named parameter,
-        ** whose type is therefore known.
-        */
-        if (receiver instanceof ParameterNode) {
-            throw new StandardException("Parameter not allowed for method receiver");
-        }
-        methodNode.addParms(parameterList);
-
-        /*
-        ** Assume this is being returned to the SQL domain.  If it turns
-        ** out that this is being returned to the Java domain, we will
-        ** get rid of this node.
-        */
-        return (ValueNode)nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-                                              methodNode,
-                                              parserContext);
-    }
-|
-    <PERIOD> methodNode = methodName(receiver)
-    {
-        /*
-        ** ? parameters are not allowed for the receiver --
-        ** unless the receiver is standing in for a named parameter,
-        ** whose type is therefore known.
-        */
-        if (receiver instanceof ParameterNode) {
-            throw new StandardException("Parameter not allowed for method receiver");
-        }
-
-        methodNode.addParms(parameterList);
-
-        /*
-        ** Assume this is being returned to the SQL domain.  If it turns
-        ** out that this is being returned to the Java domain, we will
-        ** get rid of this node.
-        */
-        return (ValueNode)nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-                                              methodNode,
-                                              parserContext);
-    }
-}
-
-MethodCallNode
-methodName(ValueNode receiver) throws StandardException :
-{
-    String methodName;
-}
-{
-    /*
-    ** NOTE: allowing a delimited identifier as a method name is necessary,
-    ** because Java is case-sensitive.  But this also allows identifiers that
-    ** do not match Java syntax.    This will probably not cause a problem
-    ** in later phases, like binding and code generation.
-    */
-    methodName = caseSensitiveIdentifierPlusReservedWords()
-    {
-        return (MethodCallNode)nodeFactory.getNode(NodeTypes.NON_STATIC_METHOD_CALL_NODE,
-                                                   methodName,
-                                                   receiver,
-                                                   parserContext);
-    }
-}
-
-MethodCallNode
-staticMethodName(String javaClassName) throws StandardException :
-{
-    String methodName;
-}
-{
-    /*
-    ** NOTE: allowing a delimited identifier as a method name is necessary,
-    ** because Java is case-sensitive.  But this also allows identifiers that
-    ** do not match Java syntax.    This will probably not cause a problem
-    ** in later phases, like binding and code generation.
-    */
-    methodName = caseSensitiveIdentifierPlusReservedWords()
-    {
-        return (MethodCallNode)nodeFactory.getNode(NodeTypes.STATIC_METHOD_CALL_NODE,
-                                                   methodName,
-                                                   javaClassName,
-                                                   parserContext);
+        return s.image;
     }
 }
 
@@ -5845,72 +5629,12 @@ methodParameter(List<ValueNode> parameterList) throws StandardException :
 ValueNode
 primary() throws StandardException :
 {
-    String javaClassName;
     ValueNode value;
 }
 {
-    // This LOOKAHEAD is required to tell a Java class from a identifier.
-    LOOKAHEAD( { javaClassFollows() } )
-    value = staticClassReference()
-    {
-        return value;
-    }
-|
     value = valueExpressionPrimary()
     {
         return value;
-    }
-}
-
-ValueNode
-staticClassReference() throws StandardException :
-{
-    String javaClassName;
-    ValueNode value;
-}
-{
-    javaClassName = javaClass() <DOUBLE_COLON> 
-        value = staticClassReferenceType(javaClassName)
-    {
-        return value;
-    }
-}
-
-ValueNode
-staticClassReferenceType(String javaClassName) throws StandardException :
-{
-    ValueNode value;
-}
-{
-    // This LOOKAHEAD is required to tell method from field reference.
-    LOOKAHEAD( { (getToken(2).kind == LEFT_PAREN) } )
-    value = staticMethodInvocation(javaClassName) 
-    {
-        return value;
-    }
-|
-    value = staticClassFieldReference(javaClassName) 
-    {
-        return value;
-    }
-}
-
-ValueNode
-staticClassFieldReference(String javaClassName) throws StandardException :
-{
-    String fieldName;
-}
-{
-    fieldName = caseSensitiveIdentifierPlusReservedWords() 
-    {
-        return (ValueNode)
-            nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-                                nodeFactory.getNode(NodeTypes.STATIC_CLASS_FIELD_REFERENCE_NODE,
-                                                    javaClassName,
-                                                    fieldName,
-                                                    nextToLastTokenDelimitedIdentifier,
-                                                    parserContext),
-                                parserContext);
     }
 }
 
@@ -6018,22 +5742,7 @@ escapedSYSFUNFunction() throws StandardException :
                                                                 new Integer(0),
                                                                 new Integer(0),
                                                                 parserContext);
-         
-        MethodCallNode methodNode = (MethodCallNode)nodeFactory.getNode(NodeTypes.STATIC_METHOD_CALL_NODE,
-                                                                        functionName,
-                                                                        null,
-                                                                        parserContext);
-
-        methodNode.addParms(parameterList);
-
-        /*
-        ** Assume this is being returned to the SQL domain.  If it turns
-        ** out that this is being returned to the Java domain, we will
-        ** get rid of this node.
-        */
-        return (ValueNode)nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-                                              methodNode,
-                                              parserContext);
+        return newRoutineInvocationNode(functionName, parameterList);
     }
 }
 
@@ -6550,15 +6259,6 @@ valueExpressionPrimary() throws StandardException :
         return value;
     }
 |
-    // This LOOKAHEAD is required to distinguish a newInvocation() from
-    // an aggregateNode() and a columnReference(). It is necessary because
-    // NEW is not a reserved word.
-    LOOKAHEAD( { newInvocationFollows(1) } )
-    value = newInvocation()
-    {
-        return value;
-    }
-|
     // This LOOKAHEAD is required to distinguish an window/aggregate
     // function from miscBuiltins(). Both can start with an identifier.
     LOOKAHEAD( { windowOrAggregateFunctionFollows() } )
@@ -6669,6 +6369,11 @@ miscBuiltinsCore(boolean isJDBCEscape) throws StandardException :
     }
 |
     value = dataTypeScalarFunction()
+    {
+        return value;
+    }
+|
+    <NULLIF> value = twoArgRoutineInvocation(getToken(0).image)
     {
         return value;
     }
@@ -7375,6 +7080,7 @@ userNode() throws StandardException :
 {
     <USER>
     {
+        checkOptionalParens();
         return (ValueNode)nodeFactory.getNode(NodeTypes.USER_NODE,
                                               parserContext);
     }
@@ -7390,6 +7096,13 @@ userNode() throws StandardException :
     {
         checkOptionalParens();
         return (ValueNode)nodeFactory.getNode(NodeTypes.SESSION_USER_NODE,
+                                              parserContext);
+    }
+|
+    <SYSTEM_USER>
+    {
+        checkOptionalParens();
+        return (ValueNode)nodeFactory.getNode(NodeTypes.SYSTEM_USER_NODE,
                                               parserContext);
     }
 }
@@ -7417,130 +7130,6 @@ currentSchemaNode() throws StandardException :
     }
 }
 
-JavaToSQLValueNode
-newInvocation() throws StandardException :
-{
-    QueryTreeNode    newNode;
-    List<ValueNode> parameterList = new ArrayList<ValueNode>();
-    String javaClassName;
-}
-{
-    <NEW> javaClassName = javaClassName() methodCallParameterList(parameterList)
-    {            
-        newNode = nodeFactory.getNode(NodeTypes.NEW_INVOCATION_NODE,
-                                      javaClassName,
-                                      parameterList,
-                                      lastTokenDelimitedIdentifier,
-                                      parserContext);
-
-        /*
-        ** Assume this is being returned to the SQL domain.  If it turns
-        ** out that this is being returned to the Java domain, we will
-        ** get rid of this node.
-        */
-        return (JavaToSQLValueNode)nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-                                                       newNode,
-                                                       parserContext);
-    }
-}
-
-/*
- * Parse a TABLE() constructor that corresponds to an internal
- * VTI invocation.  For example:
- *
- *      TABLE ( <qualifiedName> (arg1, arg2, ...) )
- *
- * where <qualifiedName> is a table name that Derby will map internally
- * to a VTI (ex. "SYSCS_DIAG.SPACE_TABLE").  The list of arguments
- * will then be passed to the VTI when it is invoked (DERBY-2152).
- *
- * An example query where this might occur is as follows:
- *
- *   SELECT * FROM TABLE(SYSCS_DIAG.SPACE_TABLE('APP', 'T1')) x
- *
- * in which case SYSCS_DIAG.SPACE_TABLE will be mapped (internally)
- * to the "org.apache.derby.diag.SpaceTable" diagnostic VTI.    Thus
- * the equivalent call prior to DERBY-2152 would have been:
- *
- *   SELECT * FROM NEW org.apache.derby.diag.SpaceTable('APP', 'T1')) x
- *
- * Note that this latter syntax is still supported.
- */
-JavaToSQLValueNode
-vtiTableConstruct() throws StandardException :
-{
-    NewInvocationNode newNode = null;
-    QueryTreeNode invocationNode = null;
-    List<ValueNode> parameterList = new ArrayList<ValueNode>();
-    TableName vtiTableName = null;
-    MethodCallNode  methodNode;
-}
-{
-    <TABLE> <LEFT_PAREN> vtiTableName = qualifiedName()
-    methodCallParameterList(parameterList)
-    <RIGHT_PAREN>
-    {
-        /* The fact that we pass a NULL table descriptor to the
-         * following call is an indication that we are mapping to a
-         * VTI table function (i.e. one that accepts arguments).
-         * Since we have the table name we do not need to pass in a
-         * TableDescriptor--we'll just create one from the table
-         * name. See NewInvocationNode for more.
-         */
-        newNode = (NewInvocationNode)nodeFactory.getNode(NodeTypes.NEW_INVOCATION_NODE,
-                                                         vtiTableName,  // TableName
-                                                         null,                  // TableDescriptor
-                                                         parameterList,
-                                                         lastTokenDelimitedIdentifier,
-                                                         parserContext);
-
-        if (newNode.isBuiltinVTI()) { 
-            invocationNode = newNode; 
-        }
-        else {
-            methodNode = (MethodCallNode)nodeFactory.getNode(NodeTypes.STATIC_METHOD_CALL_NODE,
-                                                             vtiTableName,
-                                                             null,
-                                                             parserContext);
-            methodNode.addParms(parameterList);
-
-            invocationNode = methodNode;
-        }
-        
-        /*
-        ** Assume this is being returned to the SQL domain.  If it turns
-        ** out that this is being returned to the Java domain, we will
-        ** get rid of this node.
-        */
-        return (JavaToSQLValueNode)nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-                                                       invocationNode,
-                                                       parserContext);
-    }
-}
-
-ValueNode
-staticMethodInvocation(String javaClassName) throws StandardException :
-{
-    List<ValueNode> parameterList = new ArrayList<ValueNode>();
-    MethodCallNode methodNode;
-}
-{
-    methodNode = staticMethodName(javaClassName) 
-    methodCallParameterList(parameterList)
-    {
-        methodNode.addParms(parameterList);
-
-        /*
-        ** Assume this is being returned to the SQL domain.  If it turns
-        ** out that this is being returned to the Java domain, we will
-        ** get rid of this node.
-        */
-        return (ValueNode)nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-                                              methodNode,
-                                              parserContext);
-    }
-}
-
 void
 methodCallParameterList(List<ValueNode> parameterList) throws StandardException :
 {}
@@ -7556,128 +7145,28 @@ routineInvocation() throws StandardException :
 {
     List<ValueNode> parameterList = new ArrayList<ValueNode>();
     TableName routineName;
-    MethodCallNode methodNode;
 }
 {
     routineName = qualifiedName()
     methodCallParameterList(parameterList)
     {
-        methodNode = (MethodCallNode)nodeFactory.getNode(NodeTypes.STATIC_METHOD_CALL_NODE,
-                                                         routineName,
-                                                         null,
-                                                         parserContext);
-
-        methodNode.addParms(parameterList);
-
-        /*
-        ** Assume this is being returned to the SQL domain.  If it turns
-        ** out that this is being returned to the Java domain, we will
-        ** get rid of this node.
-        */
-        return (ValueNode)nodeFactory.getNode(NodeTypes.JAVA_TO_SQL_VALUE_NODE,
-                                              methodNode,
-                                              parserContext);
-    }
-}
-
-String
-javaClass() throws StandardException :
-{
-    String javaClassName;
-}
-{
-    javaClassName = javaClassName()
-    {
-        return javaClassName;
+        return newRoutineInvocationNode(routineName, parameterList);
     }
 }
 
 ValueNode
-columnMethodInvocation() throws StandardException :
+twoArgRoutineInvocation(Object routineName) throws StandardException :
 {
-    ValueNode columnReference;
-    ValueNode methodNode;
+    List<ValueNode> arguments = new ArrayList<ValueNode>();
 }
 {
-    columnReference = columnNameForInvocation()
-    methodNode = nonStaticMethodInvocation(columnReference)
+    <LEFT_PAREN>
+    methodParameter(arguments)
+    <COMMA>
+    methodParameter(arguments)
+    <RIGHT_PAREN>
     {
-        return methodNode;
-    }
-}
-
-ValueNode
-columnNameForInvocation() throws StandardException :
-{
-    String firstName;
-    String secondName = null;
-    String thirdName = null;
-    String columnName = null;
-    String tableName = null;
-    String schemaName = null;
-    TableName tabName = null;
-    ValueNode retval;
-}
-{
-    firstName = identifier()
-    [
-        // This LOOKAHEAD is required because we have the following cases:
-        // schema.table.column.method()
-        // table.column.method()
-        // column.method()
-        // 
-        // We have to look ahead to ensure that there is at least one more
-        // PERIOD after the current one, so that we don't consider the
-        // method name to be a table or column name.
-        LOOKAHEAD( { getToken(1).kind == PERIOD && getToken(3).kind == PERIOD } )
-        <PERIOD> secondName = identifier()
-        [
-            // See above: we don't want to mistake the method name for a column name.
-            LOOKAHEAD( { getToken(1).kind == PERIOD && getToken(3).kind == PERIOD } )
-            <PERIOD> thirdName = identifier()
-        ]
-    ]
-    {
-        // Figure out what each identifier stands for
-        if (thirdName == null) {
-            if (secondName == null) {
-                // There's only one identifier, so it must be a column name
-                columnName = firstName;
-            }
-            else {
-                // There are two identifiers, so they are table and column names
-                tableName = firstName;
-                columnName = secondName;
-            }
-        }
-        else {
-            // There are three identifiers,
-            // so they are schema, table, and column names
-            schemaName = firstName;
-            tableName = secondName;
-            columnName = thirdName;
-        }
-
-        if (tableName != null) {
-            // There is a table name, so get a TableName node
-            tabName =
-                (TableName)nodeFactory.getNode(NodeTypes.TABLE_NAME,
-                                               schemaName,
-                                               tableName,
-                                               new Integer(nextToLastIdentifierToken.beginOffset),
-                                               new Integer(nextToLastIdentifierToken.endOffset),
-                                               parserContext);
-        }
-
-        // Get the column reference
-        retval = (ValueNode)nodeFactory.getNode(NodeTypes.COLUMN_REFERENCE,
-                                                columnName,
-                                                tabName,
-                                                new Integer(lastIdentifierToken.beginOffset),
-                                                new Integer(lastIdentifierToken.endOffset),
-                                                parserContext);
-
-        return retval;
+        return newRoutineInvocationNode(routineName, arguments);
     }
 }
 
@@ -7798,6 +7287,9 @@ atIsolationLevel() throws StandardException :
     IsolationLevel isolationLevel;
 }
 {
+    LOOKAHEAD( { getToken(1).kind == WITH &&
+                (getToken(2).kind == RR || getToken(2).kind == RS ||
+                 getToken(2).kind == CS || getToken(2).kind == UR )  } )
     <WITH> isolationLevel = isolationLevelDB2Abbrev()
     {
         return isolationLevel;
@@ -7927,7 +7419,7 @@ offsetClause() throws StandardException :
     | 
         result = dynamicParameterSpecification()
     )
-    ( <ROW> | <ROWS> )
+    [ <ROW> | <ROWS> ]
     {
         return result;
     }
@@ -8116,7 +7608,6 @@ nullSpecification() throws StandardException :
 StatementNode
 insertColumnsAndSource(QueryTreeNode targetTable) throws StandardException :
 {
-    Properties targetProperties = null;
     ResultSetNode queryExpression;
     ResultColumnList columnList = null;
     OrderByList orderCols = null;
@@ -8124,6 +7615,7 @@ insertColumnsAndSource(QueryTreeNode targetTable) throws StandardException :
     ResultColumnList returningList = null;
 }
 {
+(
     [
         // This LOOKAHEAD is required because a query expression can
         // be a SELECT or VALUES nested arbitrarily deep in parentheses
@@ -8133,11 +7625,27 @@ insertColumnsAndSource(QueryTreeNode targetTable) throws StandardException :
         LOOKAHEAD( { getToken(1).kind == LEFT_PAREN && ! subqueryFollows() } )
         <LEFT_PAREN> columnList = insertColumnList() <RIGHT_PAREN>
     ]
-    [ targetProperties = propertyList(false) <CHECK_PROPERTIES>]
     queryExpression = queryExpression(null, NO_SET_OP)
     [ orderCols = orderByClause() ]
     ( offsetOrFetchFirstClause(offsetAndFetchFirst) )*
-    [ <RETURNING> returningList = selectList() ] 
+|
+    // Equivalent to VALUES (DEFAULT)
+    <_DEFAULT> <VALUES>
+    {
+        ResultColumnList defList = (ResultColumnList)nodeFactory.getNode(NodeTypes.RESULT_COLUMN_LIST, parserContext);
+        defList.addResultColumn((ResultColumn)nodeFactory.getNode(NodeTypes.RESULT_COLUMN,
+                                                                  null,
+                                                                  nodeFactory.getNode(NodeTypes.DEFAULT_NODE,
+                                                                                      null,
+                                                                                      parserContext),
+                                                                  parserContext));
+        queryExpression = (RowResultSetNode)nodeFactory.getNode(NodeTypes.ROW_RESULT_SET_NODE,
+                                                                defList,
+                                                                null,
+                                                                parserContext);
+    }
+)
+    [ <RETURNING> returningList = selectList() ]
     {
         if (orderCols != null && isTableValueConstructor(queryExpression)) {
             // Not allowed by the standard since this is a <contextually typed
@@ -8158,21 +7666,13 @@ insertColumnsAndSource(QueryTreeNode targetTable) throws StandardException :
                                                   targetTable,
                                                   columnList,
                                                   queryExpression,
-                                                  targetProperties,
+                                                  null /*properties*/,
                                                   orderCols,
                                                   offsetAndFetchFirst[0],
                                                   offsetAndFetchFirst[1],
                                                   returningList,
                                                   parserContext);
     }
-    /* RESOLVE: Ignoring default values for now
-|
-    [ targetProperties = propertyList(false) <CHECK_PROPERTIES>]
-    <_DEFAULT> <VALUES>
-    {
-        return null;
-    }
-    */
 }
 
 ResultColumnList
@@ -8619,7 +8119,6 @@ fromClause() throws StandardException :
 }
 {
     <FROM> { beginToken = getToken(1); }
-    [ fromListProperties(fromList) ]
     tableReferences(fromList)
     ( <COMMA> tableReferences(fromList) )* { endToken = getToken(0); }
     {
@@ -8630,37 +8129,11 @@ fromClause() throws StandardException :
 }
 
 void
-fromListProperties(FromList fromList) throws StandardException :
-{
-    Properties properties;
-}
-{
-    properties = propertyList(true) <CHECK_PROPERTIES>
-    {
-        fromList.setProperties(properties);
-    }
-}
-
-void
 tableReferences(FromList fromList) throws StandardException :
 {
     FromTable tableReference;
 }
 {
-    /* If we have a table constructor and the expression is a SELECT
-     * query or a VALUES query then we read the <TABLE> keyword;
-     * otherwise we leave the <TABLE> token in the queue and let
-     * other types of expressions (namely, vtiTableConstruct())
-     * deal with it accordingly.    DERBY-2152.
-     */
-    LOOKAHEAD( { getToken(1).kind == TABLE && getToken(2).kind == LEFT_PAREN &&
-                                 (getToken(3).kind == SELECT || getToken(3).kind == VALUES) } )
-    <TABLE>
-    tableReference = tableReferenceTypes(false)
-    {
-        fromList.addFromTable(tableReference);
-    }
-|
     tableReference = tableReferenceTypes(false)
     {
         fromList.addFromTable(tableReference);
@@ -8688,19 +8161,11 @@ Object[]
 optionalTableClauses() throws StandardException :
 {
     Object[] otc = null;
-    Properties tableProperties = null;
     ResultColumnList derivedRCL = null;
     String correlationName = null;
     IndexHintList indexHints = null;
 }
 {
-    otc = optionalTableProperties() 
-    {
-        otc[OPTIONAL_TABLE_DERIVED_RCL] = derivedRCL;
-        otc[OPTIONAL_TABLE_CORRELATION_NAME] = correlationName;
-        return otc;
-    }
-|
     LOOKAHEAD( { indexHintFollows(1) } )
     indexHints = indexHints()
     {
@@ -8714,29 +8179,13 @@ optionalTableClauses() throws StandardException :
         correlationName = identifier()
         [ <LEFT_PAREN> derivedRCL = derivedColumnList() <RIGHT_PAREN> ] 
         [ indexHints = indexHints() ]
-        [ tableProperties = propertyList(true) <CHECK_PROPERTIES> ] 
     ]
     {
         otc = new Object[OPTIONAL_TABLE_NCLAUSES];
-        otc[OPTIONAL_TABLE_PROPERTIES] = tableProperties;
+        otc[OPTIONAL_TABLE_PROPERTIES] = null;
         otc[OPTIONAL_TABLE_DERIVED_RCL] = derivedRCL;
         otc[OPTIONAL_TABLE_CORRELATION_NAME] = correlationName;
         otc[OPTIONAL_TABLE_MYSQL_INDEX_HINTS] = indexHints;
-        return otc;
-    }
-}
-
-Object[]
-optionalTableProperties() throws StandardException :
-{
-    Object[] otc = null;
-    Properties tableProperties = null;
-}
-{
-    tableProperties = propertyList(true) <CHECK_PROPERTIES> 
-    {
-        otc = new Object[OPTIONAL_TABLE_NCLAUSES];
-        otc[OPTIONAL_TABLE_PROPERTIES] = tableProperties;
         return otc;
     }
 }
@@ -8822,11 +8271,17 @@ void
 indexHintIndex(List<String> indexes) throws StandardException :
 {
     String index;
+    Token token;
 }
 {
     index = identifier()
     {
         indexes.add(index);
+    }
+|
+    token = <PRIMARY>
+    {
+        indexes.add(token.image);
     }
 }
 
@@ -8851,7 +8306,6 @@ tableReference(boolean nestedInParens) throws StandardException :
 FromTable
 tableFactor() throws StandardException :
 {
-    JavaToSQLValueNode javaToSQLNode = null;
     TableName tableName;
     String correlationName = null;
     ResultColumnList derivedRCL = null;
@@ -8862,28 +8316,6 @@ tableFactor() throws StandardException :
     SubqueryNode derivedTable;
 }
 {
-    // NOTE: this rule has to come first in order to avoid making NEW a reserved word.
-    (
-        LOOKAHEAD( { newInvocationFollows(1) } )
-        javaToSQLNode = newInvocation()
-    | 
-        javaToSQLNode = vtiTableConstruct()
-    )
-    [ <AS> ] correlationName = identifier()
-    [ <LEFT_PAREN> derivedRCL = derivedColumnList() <RIGHT_PAREN> ]
-    [ optionalTableClauses = optionalTableProperties() ]
-    {
-        fromTable = (FromTable)nodeFactory.getNode(NodeTypes.FROM_VTI,
-                                                   javaToSQLNode.getJavaValueNode(),
-                                                   correlationName,
-                                                   derivedRCL,
-                                                   ((optionalTableClauses != null) ? 
-                                                    (Properties)optionalTableClauses[OPTIONAL_TABLE_PROPERTIES] :
-                                                    (Properties)null),
-                                                   parserContext); 
-        return fromTable;
-    }
-|
     tableName = qualifiedName() 
     optionalTableClauses = optionalTableClauses()
     {
@@ -8918,7 +8350,6 @@ tableFactor() throws StandardException :
     derivedTable = derivedTable() 
     [ <AS> ] correlationName = identifier()
     [ <LEFT_PAREN> derivedRCL = derivedColumnList() <RIGHT_PAREN> ]
-    [ optionalTableClauses = optionalTableProperties() ]
     {
         fromTable = (FromTable)nodeFactory.getNode(NodeTypes.FROM_SUBQUERY,
                                                    derivedTable.getResultSet(),
@@ -9013,53 +8444,59 @@ indexItemList(IndexColumnList columnList) throws StandardException :
 
 void indexItem(IndexColumnList columnList) throws StandardException :
 {
-    String columnName;
+    String firstName = null;
+    String columnName = null;
     boolean asc = true;
+    int firstFunctionArgPosition = -1;
+    int functionArgCount = -1;
 }
 {
-    (
-      <Z_ORDER_LAT_LON>
-      <LEFT_PAREN>
-      columnName = identifier()
-      {
-          int latPosition = columnList.size();
-          IndexColumn lat = (IndexColumn)
-              nodeFactory.getNode(NodeTypes.INDEX_COLUMN,
-                                  columnName,
-                                  Boolean.FALSE,
-                                  parserContext);
-          columnList.add(lat);
-      }
-      <COMMA>
-      columnName = identifier()
-      {
-          IndexColumn lon = (IndexColumn)
-              nodeFactory.getNode(NodeTypes.INDEX_COLUMN,
-                                  columnName,
-                                  Boolean.FALSE,
-                                  parserContext);
-          columnList.add(lon);
-      }
-      <RIGHT_PAREN>
-      {
-          columnList.applyFunction(IndexColumnList.FunctionType.Z_ORDER_LAT_LON,
-                                   latPosition,
-                                   2);
-      }
-    )
-    |
-    (
-      columnName = identifier() 
-      [ <ASC> | <DESC> { asc = false; } ]
-      {
-          IndexColumn indexColumn = (IndexColumn)
-              nodeFactory.getNode(NodeTypes.INDEX_COLUMN,
-                                  columnName,
-                                  asc ? Boolean.TRUE : Boolean.FALSE,
-                                  parserContext);
-          columnList.add(indexColumn);
-    }
-    )
+    firstName = identifier()
+    ( (
+        <LEFT_PAREN>
+        columnName = identifier()
+        {
+            firstFunctionArgPosition = columnList.size();
+            IndexColumn lat = (IndexColumn)
+                nodeFactory.getNode(NodeTypes.INDEX_COLUMN,
+                                    columnName,
+                                    Boolean.FALSE,
+                                    parserContext);
+            columnList.add(lat);
+            functionArgCount = 1;
+        }
+        [
+            <COMMA>
+            columnName = identifier()
+            {
+                IndexColumn lon = (IndexColumn)
+                    nodeFactory.getNode(NodeTypes.INDEX_COLUMN,
+                                        columnName,
+                                        Boolean.FALSE,
+                                        parserContext);
+                columnList.add(lon);
+                functionArgCount = 2;
+            }
+        ]
+        <RIGHT_PAREN>
+        {
+            columnList.applyFunction(firstName,
+                                     firstFunctionArgPosition,
+                                     functionArgCount);
+        }
+      )
+      |
+      (
+        [ <ASC> | <DESC> { asc = false; } ]
+        {
+            IndexColumn indexColumn = (IndexColumn)
+                nodeFactory.getNode(NodeTypes.INDEX_COLUMN,
+                                    firstName,
+                                    asc ? Boolean.TRUE : Boolean.FALSE,
+                                    parserContext);
+            columnList.add(indexColumn);
+        }
+    ) )
 }
 
 void
@@ -9217,6 +8654,11 @@ outerJoinType() throws StandardException :
     <RIGHT> 
     {
         return JoinNode.JoinType.RIGHT_OUTER;
+    }
+|
+    <FULL> 
+    {
+        return JoinNode.JoinType.FULL_OUTER;
     }
 }
 
@@ -9457,16 +8899,21 @@ QueryTreeNode
 overClause() throws StandardException :
 {
     String windowRef;
+    PartitionByList partitionCols = null;
     OrderByList orderCols = null;
 }
 {
     LOOKAHEAD( { getToken(2).kind == LEFT_PAREN || getToken(2).kind == IDENTIFIER } )
     <OVER>
     ( 
-        <LEFT_PAREN> [ orderCols = orderByClause() ] <RIGHT_PAREN>
+        <LEFT_PAREN>
+        [ partitionCols = partitionByClause() ] 
+        [ orderCols = orderByClause() ] 
+        <RIGHT_PAREN>
     {
         return (QueryTreeNode)nodeFactory.getNode(NodeTypes.WINDOW_DEFINITION_NODE,
                                                   null,
+                                                  partitionCols,
                                                   orderCols,
                                                   parserContext);
     }
@@ -9478,6 +8925,44 @@ overClause() throws StandardException :
                                                    parserContext);
     }
  )
+}
+
+PartitionByList
+partitionByClause() throws StandardException :
+{
+    PartitionByList partitionByList = (PartitionByList)nodeFactory.getNode(NodeTypes.PARTITION_BY_LIST,
+                                                                       parserContext);
+}
+{
+    <PARTITION> <BY>
+    windowPartitionColumnReference(partitionByList)
+    ( <COMMA> windowPartitionColumnReference(partitionByList) )*
+    {
+        return partitionByList;
+    }
+}
+
+void
+windowPartitionColumnReference(PartitionByList partitionByList) throws StandardException :
+{
+    ColumnReference column;
+    String collation = null; 
+}
+{
+    column = columnReference()
+    [ collation = collateClause() ]
+    {
+        ValueNode partitionColumn = column;
+        if (collation != null)
+            partitionColumn = (ValueNode)nodeFactory.getNode(NodeTypes.EXPLICIT_COLLATE_NODE,
+                                                             partitionColumn,
+                                                             collation,
+                                                             parserContext);
+        PartitionByColumn partitionBy = (PartitionByColumn)nodeFactory.getNode(NodeTypes.PARTITION_BY_COLUMN,
+                                                                               partitionColumn,
+                                                                               parserContext);
+        partitionByList.add(partitionBy);
+    }
 }
 
 ValueNode
@@ -9729,15 +9214,15 @@ dynamicParameterSpecification() throws StandardException :
     Token tok;
 }
 {
-    <QUESTION_MARK>
+    tok = <QUESTION_MARK>
     {
-        return makeParameterNode(parameterNumber++);
+        return makeParameterNode(parameterNumber++, tok);
     }
 |
     tok = <DOLLAR_N>
     {
         int n = Integer.parseInt(tok.image.substring(1));
-        return makeParameterNode(n-1);
+        return makeParameterNode(n-1, tok);
     }
 }
 
@@ -9850,15 +9335,20 @@ WindowList
 windowDefinition(WindowList wl) throws StandardException :
 {
     String windowName;
+    PartitionByList partitionCols = null;
     OrderByList orderCols = null;
 }
 {
     windowName = identifier()
-    <AS> <LEFT_PAREN> [ orderCols = orderByClause() ] <RIGHT_PAREN>
+    <AS> <LEFT_PAREN>
+    [ partitionCols = partitionByClause() ] 
+    [ orderCols = orderByClause() ] 
+    <RIGHT_PAREN>
     {
         wl.addWindow(
             (WindowDefinitionNode)nodeFactory.getNode(NodeTypes.WINDOW_DEFINITION_NODE,
                                                       windowName,
+                                                      partitionCols,
                                                       orderCols,
                                                       parserContext));
 
@@ -9881,7 +9371,7 @@ schemaDefinition() throws StandardException :
     ** CREATE SCHEMA:
     ** We are not currently handling schema bodies.
     */
-    <SCHEMA> cond = createCondition()
+    <SCHEMA> cond = notExistsCondition()
     (
         schemaName = identifier() [ <AUTHORIZATION> authName = identifier() ]
     |
@@ -9934,12 +9424,14 @@ sequenceDefinition() throws StandardException :
     Long stepValue = null;
     Long maxValue = null;
     Long minValue = null;
-    Boolean cycle = Boolean.FALSE;
+    Boolean cycle = null;
     Object[] optionalClauses = new Object[SEQUENCE_NCLAUSES];
+    StorageFormatNode storage = null;
 }
 {
     <SEQUENCE> qualifiedSequenceName = qualifiedName()
     ( sequenceGeneratorOption( optionalClauses ) )*
+    [ <STORAGE_FORMAT> storage = storageFormat() ]
     {
         if (optionalClauses[SEQUENCE_DATA_TYPE] != null) { 
             dtd = (DataTypeDescriptor)optionalClauses[SEQUENCE_DATA_TYPE]; 
@@ -9972,6 +9464,7 @@ sequenceDefinition() throws StandardException :
                                                   maxValue,
                                                   minValue,
                                                   cycle,
+                                                  storage,
                                                   parserContext);
     }
 }
@@ -10091,10 +9584,11 @@ dropSequenceStatement() throws StandardException :
     /*
      * DROP SEQUENCE <sequencename> RESTRICT
      */
-    <SEQUENCE> cond = dropCondition() sequenceName = qualifiedName() <RESTRICT>
+    <SEQUENCE> cond = existsCondition() sequenceName = qualifiedName() <RESTRICT>
     {
         return (StatementNode)nodeFactory.getNode(NodeTypes.DROP_SEQUENCE_NODE,
                                                   sequenceName,
+                                                  new Integer(StatementType.DROP_RESTRICT),
                                                   cond,
                                                   parserContext);
     }
@@ -10105,35 +9599,42 @@ tableDefinition() throws StandardException :
 {
     TableName tableName;
     TableElementList tableElementList;
-    Properties properties = null;
     char lockGranularity = CreateTableNode.DEFAULT_LOCK_GRANULARITY;
     ResultColumnList resultColumns = null;
-    ResultSetNode queryExpression;
+    CursorNode queryExpression;
     boolean withData = true;
     ExistenceCheck cond;
+    StorageFormatNode storage = null;
+    int beginOffset;
+    int endOffset;
 }
 {
-    <TABLE> cond = createCondition() tableName = qualifiedName()
+    <TABLE> cond = notExistsCondition() tableName = qualifiedName()
     // Lookahead needed to choose between tableElementList and
     // tableColumnList.
     (        
         LOOKAHEAD( { getToken(1).kind == LEFT_PAREN && 
                      getToken(3).kind != COMMA && getToken(3).kind != RIGHT_PAREN } )
         tableElementList = tableElementList()
-        [ properties = propertyList(false)<CHECK_PROPERTIES>]
+        [ <STORAGE_FORMAT> storage = storageFormat() ]
     {
         return (StatementNode)nodeFactory.getNode(NodeTypes.CREATE_TABLE_NODE,
                                                   tableName,
                                                   tableElementList,
-                                                  properties,
+                                                  null /*properties*/,
                                                   new Character(lockGranularity),
                                                   cond,
+                                                  storage,
                                                   parserContext);
     }
     |
         [ <LEFT_PAREN> resultColumns = tableColumnList() <RIGHT_PAREN> ]
-        <AS> queryExpression = queryExpression(null, NO_SET_OP)
-        <WITH> [ <NO> { withData = false; } ] <DATA>
+        <AS>
+        {beginOffset = getToken(0).endOffset + 1;}
+        queryExpression = preparableSelectStatement()
+        <WITH>
+        {endOffset = getToken(0).beginOffset - 1;}
+        [ <NO> { withData = false; } ] <DATA>
     {
         /* Parameters not allowed in create table */
         HasNodeVisitor visitor =
@@ -10148,6 +9649,9 @@ tableDefinition() throws StandardException :
                                                                   resultColumns,
                                                                   queryExpression,
                                                                   cond,
+                                                                  sliceSQLText(beginOffset, endOffset, false),
+                                                                  true,
+                                                                  true,
                                                                   parserContext);
         if (withData) {
             ((CreateTableNode)result).markWithData();
@@ -10167,65 +9671,6 @@ tableColumnList() throws StandardException :
     columnNameList(resultColumns)
     {
         return resultColumns;
-    }
-}
-
-/*
- * This method is called when a comment starting with --derby-properties is found.
- * Such a comment is a special directive to Derby and allows a sql to pass optimizer
- * overrides. Derby looks for propertyName=value [,propertyName=value]* after
- * --derby-properties and returns these properties in a Properties object as a return 
- * value of this method.
- * The param propertiesUseAllowed true indicates that users are allowed to 
- * specify optimizer overrides in the given context. 
- * False means optimizer overrides in the given context are allowed internally 
- * only eg impl/load/import.java specifies property insertMode=replace/bulkInsert
- * in the insert statement. This same property will not be acceptable from an 
- * insert statement from a user sql.
- */
-Properties
-propertyList(boolean propertiesUseAllowed) throws StandardException :
-{
-    Properties properties = new Properties();
-    StringTokenizer commaSeparatedProperties;
-    StringTokenizer equalOperatorSeparatedProperty;
-}
-{
-    <DERBYDASHPROPERTIES> 
-    {
-        //first use StringTokenizer to get tokens which are delimited by ,s
-        commaSeparatedProperties = new StringTokenizer(getToken(1).image, ",");
-        while (commaSeparatedProperties.hasMoreTokens()) {
-            //Now verify that tokens delimited by ,s follow propertyName=value pattern
-            String currentProperty = commaSeparatedProperties.nextToken();
-            equalOperatorSeparatedProperty = new StringTokenizer(currentProperty,"=", true);
-            if (equalOperatorSeparatedProperty.countTokens() != 3)
-                throw new StandardException("Invalid properties syntax");
-            else {
-                String key = equalOperatorSeparatedProperty.nextToken().trim();
-                if (!equalOperatorSeparatedProperty.nextToken().equals("="))
-                    throw new StandardException("Invalid properties syntax");
-                String value = equalOperatorSeparatedProperty.nextToken().trim();
-                parserContext.checkStringLiteralLengthLimit(value);
-                /* Trim off the leading and trailing ', and compress all '' to ' */
-                if (value.startsWith("'") && value.endsWith("'"))
-                    value = trimAndCompressQuotes(value, SINGLEQUOTES, false);
-                /* Trim off the leading and trailing ", and compress all "" to " */
-                else if (value.startsWith("\"") && value.endsWith("\""))
-                    value = trimAndCompressQuotes(value, DOUBLEQUOTES, false);
-                else 
-                    value = value.toUpperCase();
-                // Do not allow user to specify multiple values for the same key
-                if (properties.put(key, value) != null) {
-                    throw new StandardException("Duplicate property: " + key);
-                }
-            }
-        }
-        //if this property override is supported in internal mode only, then do that verification here.
-        if (!propertiesUseAllowed) {
-            // TODO: What to do?
-        }
-        return properties;
     }
 }
 
@@ -10261,19 +9706,18 @@ StatementNode
 indexDefinition() throws StandardException :
 {
     Boolean unique = Boolean.FALSE;
-    Properties properties = null;
     TableName indexName;
     TableName tableName;
     IndexColumnList indexColumnList = null;
     boolean groupFormat = hasFeature(SQLParserFeature.GROUPING);
     JoinNode.JoinType joinType = null;
     ExistenceCheck cond;
-    StorageLocation location = null;
+    StorageFormatNode storage = null;
 }
 {
     [ unique = unique() ] 
     <INDEX>
-    cond = createCondition()
+    cond = notExistsCondition()
     indexName = qualifiedName() 
     <ON> tableName = qualifiedName()
     <LEFT_PAREN>
@@ -10287,8 +9731,7 @@ indexDefinition() throws StandardException :
     <RIGHT_PAREN>
     [ LOOKAHEAD ( { groupFormat && getToken(1).kind == USING } )
       <USING> joinType = joinType() <JOIN> ]
-    [ properties = propertyList(false) <CHECK_PROPERTIES>]
-    [ <AS> location = getLocation() ]
+    [ <STORAGE_FORMAT> storage = storageFormat() ]
     {
         /* User allowed to specify schema name on table and index.
          * If no schema name specified for index, then it "inherits" 
@@ -10314,14 +9757,13 @@ indexDefinition() throws StandardException :
         }
         return (StatementNode)nodeFactory.getNode(NodeTypes.CREATE_INDEX_NODE,
                                                   unique,
-                                                  null,
                                                   indexName,
                                                   tableName,
                                                   indexColumnList,
                                                   joinType,
-                                                  properties,
+                                                  null /*properties*/,
                                                   cond,
-                                                  location,
+                                                  storage,
                                                   parserContext);
     }
 }
@@ -10345,16 +9787,18 @@ unique() throws StandardException :
     0 - Object[] 3 element array for parameters
     1 - TableName - specific name
     2 - Integer - dynamic result set count
-    3 - String language (always java) - ignore
-    4 - String external name (also passed directly to create alias node - ignore
-    5 - Short parameter style (always java) - ignore 
+    3 - String language
+    4 - String external name
+    5 - Short parameter style
     6 - Short - SQL allowed.
     7 - Boolean - CALLED ON NULL INPUT (always TRUE for procedures)
     8 - DataTypeDescriptor - return type (always NULL for procedures)
+    9 - Boolean - definers rights
+   10 - String - inline definition
 */
 
 StatementNode
-procedureDefinition() throws StandardException :
+procedureDefinition(Boolean createOrReplace) throws StandardException :
 {
     TableName procedureName;
     Object[] procedureElements = new Object[CreateAliasNode.ROUTINE_ELEMENT_COUNT];
@@ -10369,7 +9813,8 @@ procedureDefinition() throws StandardException :
         return getCreateAliasNode(procedureName,
                                   (String)procedureElements[CreateAliasNode.EXTERNAL_NAME],
                                   procedureElements,
-                                  AliasInfo.Type.PROCEDURE);
+                                  AliasInfo.Type.PROCEDURE,
+                                  createOrReplace);
     }
 }
 
@@ -10623,16 +10068,18 @@ inoutParameter() :
     0 - Object[] 3 element array for parameters
     1 - TableName - specific name
     2 - Integer - dynamic result set count - always 0
-    3 - String language (always java) - required to be set
-    4 - String external name (also passed directly to create alias node - ignore
-    5 - Short parameter style (always java) - required to be set 
+    3 - String language
+    4 - String external name
+    5 - Short parameter style
     6 - Short - SQL allowed.
     7 - Boolean - CALLED ON NULL INPUT
     8 - DataTypeDescriptor - return type
+    9 - Boolean - definers rights
+   10 - String - inline definition
 */
 
 StatementNode
-functionDefinition() throws StandardException :
+functionDefinition(Boolean createOrReplace) throws StandardException :
 {
     TableName functionName;
     DataTypeDescriptor returnType;
@@ -10650,7 +10097,8 @@ functionDefinition() throws StandardException :
         return getCreateAliasNode(functionName,
                                   (String)functionElements[CreateAliasNode.EXTERNAL_NAME],
                                   functionElements,
-                                  AliasInfo.Type.FUNCTION);
+                                  AliasInfo.Type.FUNCTION,
+                                  createOrReplace);
     }
 }
 
@@ -10752,7 +10200,7 @@ functionTableReturnColumn(List<String> names, List<DataTypeDescriptor> types)
 */
 
 StatementNode
-udtDefinition() throws StandardException :
+udtDefinition(Boolean createOrReplace) throws StandardException :
 {
     TableName udtName;
     String externalName;
@@ -10765,7 +10213,8 @@ udtDefinition() throws StandardException :
         return getCreateAliasNode(udtName,
                                   externalName,
                                   null,
-                                  AliasInfo.Type.UDT);
+                                  AliasInfo.Type.UDT,
+                                  createOrReplace);
     }
 }
 
@@ -10783,7 +10232,7 @@ viewDefinition(Token beginToken) throws StandardException :
     ExistenceCheck cond;
 }
 {
-    <VIEW> cond = createCondition() tableName = qualifiedName() 
+    <VIEW> cond = notExistsCondition() tableName = qualifiedName()
     [ <LEFT_PAREN> resultColumns = viewColumnList() <RIGHT_PAREN> ]
     <AS> queryExpression = queryExpression(null, NO_SET_OP)
     [ orderCols = orderByClause() ]
@@ -10820,18 +10269,17 @@ viewColumnList() throws StandardException :
                                                                            parserContext);
 }
 {
-    // TODO: What is this comment about?
-    /* RESOLVE: Passing null parameter for now just to keep Java happy */
     columnNameList(resultColumns)
     {
         return resultColumns;
     }
 }
 
+
 StatementNode
 triggerDefinition() throws StandardException :
 {
-    Boolean isBefore;
+    CreateTriggerNode.Time time;
     Boolean isRow = Boolean.FALSE;  // STATEMENT implicit by default
     TableName tableName;
     TableName triggerName;
@@ -10841,33 +10289,33 @@ triggerDefinition() throws StandardException :
     Token endToken;
     int actionBegin;
     int actionEnd;
-    int triggerEvent;
-    QueryTreeNode actionNode;
+    ValueNode whenClause = null;
+    CreateTriggerNode.Event event;
+    List<StatementNode> actionNodes = null;
     ResultColumnList triggerColumns = (ResultColumnList)nodeFactory.getNode(NodeTypes.RESULT_COLUMN_LIST,
                                                                             parserContext);
     List<TriggerReferencingStruct> refClause = null;
 }
 {
     <TRIGGER> triggerName = qualifiedName()
-    isBefore = beforeOrAfter()
-    triggerEvent = triggerEvent(triggerColumns)
+    time = triggerTime()
+    event = triggerEvent(triggerColumns)
     <ON> tableName = qualifiedName()
     [ refClause = triggerReferencingClause() ]
     [ <FOR> <EACH> isRow = rowOrStatement() ]
-    [ <MODE> <DB2SQL> ]
-    actionNode = proceduralStatement(tokenHolder)
+    [ <WHEN> <LEFT_PAREN> whenClause = valueExpression() <RIGHT_PAREN> ]
+    actionNodes = triggerActionNodes(tokenHolder)
     {
         actionEnd = getToken(0).endOffset;
         actionBegin = tokenHolder[0].beginOffset;
 
-        // No DML in action node for BEFORE triggers.
-        if (isBefore.booleanValue() && (actionNode instanceof DMLModStatementNode)) {
-            throw new StandardException("DML not allowed in BEFORE trigger");
-        }
-
         // No params in trigger action.
         HasNodeVisitor visitor = new HasNodeVisitor(ParameterNode.class);
-        actionNode.accept(visitor);
+        if (actionNodes != null) {
+            for (StatementNode actionNode : actionNodes) {
+                actionNode.accept(visitor);
+            }
+        }
         if (visitor.hasNode()) {
             throw new StandardException("Parameters not allowed in trigger action");
         }
@@ -10875,25 +10323,25 @@ triggerDefinition() throws StandardException :
         return (StatementNode)nodeFactory.getNode(NodeTypes.CREATE_TRIGGER_NODE,
                                                   triggerName,
                                                   tableName,
-                                                  triggerEvent,
+                                                  event,
                                                   triggerColumns,
-                                                  isBefore,    
+                                                  time,
                                                   isRow,
-                                                  Boolean.TRUE,                   // enabled
-                                                  refClause,          // referencing clause
-                                                  null,// when clause node
-                                                  null,           // when clause text
-                                                  0,
-                                                  // when clause begin offset
-                                                  actionNode,
+                                                  Boolean.TRUE, // enabled
+                                                  refClause,
+                                                  whenClause,
+                                                  actionNodes,
                                                   sliceSQLText(actionBegin, actionEnd, false),
                                                   actionBegin,
                                                   parserContext);
     }
 }
 
+
+
+
 StatementNode
-synonymDefinition() throws StandardException :
+synonymDefinition(Boolean createOrReplace) throws StandardException :
 {
     TableName synonymName;
     TableName targetName;
@@ -10906,42 +10354,48 @@ synonymDefinition() throws StandardException :
                                                              targetName,
                                                              null,
                                                              AliasInfo.Type.SYNONYM,
+                                                             createOrReplace,
                                                              parserContext);
     }
 }
 
-Boolean
-beforeOrAfter() :
+CreateTriggerNode.Time
+triggerTime() :
 {}
 {
-    <NO> <CASCADE> <BEFORE> 
+    <BEFORE>
     {
-        return Boolean.TRUE;
+        return CreateTriggerNode.Time.Before;
     }
-|       
+|
     <AFTER>
     {
-        return Boolean.FALSE;
+        return CreateTriggerNode.Time.After;
+    }
+|
+    <INSTEAD> <OF>
+    {
+        return CreateTriggerNode.Time.InsteadOf;
     }
 }
 
-int
+CreateTriggerNode.Event
 triggerEvent(ResultColumnList rcl) throws StandardException :
 {}
 {
-    <INSERT> 
+    <INSERT>
     {
-        return CreateTriggerNode.TRIGGER_EVENT_INSERT;
+        return CreateTriggerNode.Event.Insert;
     }
-|       
+|
     <DELETE>
     {
-        return CreateTriggerNode.TRIGGER_EVENT_DELETE;
+        return CreateTriggerNode.Event.Delete;
     }
-|    
+|
     <UPDATE> [ <OF> columnNameList(rcl) ]
     {
-        return CreateTriggerNode.TRIGGER_EVENT_UPDATE;
+        return CreateTriggerNode.Event.Update;
     }
 }
 
@@ -10996,7 +10450,38 @@ triggerReferencingExpression(List<TriggerReferencingStruct> list)
         list.add(new TriggerReferencingStruct(isRow, isNew, identifier));
     }
 }
- 
+
+List<StatementNode>
+triggerActionNodes(Token[] tokenHolder) throws StandardException :
+{
+    List<StatementNode> list = new ArrayList<StatementNode>();
+    tokenHolder[0] = getToken(1);
+    Token[] ignoredToken = new Token[1];
+}
+{
+    triggerActionNode(list, tokenHolder)
+    { return list; }
+    |
+    <BEGIN> <ATOMIC>
+    ( triggerActionNode(list, ignoredToken) <SEMICOLON> )*
+    <END>
+    {
+        return list;
+    }
+}
+
+void
+triggerActionNode(List<StatementNode> statements, Token[] tokenHolder) throws StandardException :
+{
+    StatementNode action;
+}
+{
+    action = proceduralStatement(tokenHolder)
+    {
+        statements.add(action);
+    }
+}
+
 ValueNode
 defaultClause(long[] autoIncrementInfo, String columnName) throws StandardException :
 {
@@ -11154,17 +10639,14 @@ defaultOption(Token beginToken, long[] autoIncrementInfo, String columnName)
     ValueNode value;
 }
 {
-    //Look ahead required to tell NULL from a class name which starts with
-    // NULL (e.g., NULL::)
-    LOOKAHEAD( { getToken(1).kind == NULL && 
-                                 !(getToken(2).kind == PERIOD || getToken(2).kind == DOUBLE_COLON) } )
+    LOOKAHEAD( { getToken(1).kind == NULL } )
     <NULL>
     {
         return (ValueNode)nodeFactory.getNode(NodeTypes.UNTYPED_NULL_CONSTANT_NODE,
                                               parserContext);
     }
 |
-    value = DB2DefaultOption(columnName)
+    value = setValueNodeDefaultOption(columnName)
     {
         endToken = getToken(0);
         value.setBeginOffset(beginToken.beginOffset);
@@ -11178,19 +10660,11 @@ defaultOption(Token beginToken, long[] autoIncrementInfo, String columnName)
 }
 
 ValueNode
-DB2DefaultOption(String columnName) throws StandardException :
+setValueNodeDefaultOption(String columnName) throws StandardException :
 {
     ValueNode value;
 }
 {
-    // DB2 spec says default can only be one of the
-    // following: <constant>, <datetime-special-register> (ex.
-    // "current time"), CURRENT SCHEMA, USER, NULL, or
-    // <cast-function>.  We currently support all of these
-    // except the 'blob' function that is part of the DB2 valid
-    // <cast-function> grammar.  See beetle 5281 for plans
-    // support 'blob' function in future.
-
     LOOKAHEAD( { getToken(2).kind == SCHEMA || getToken(2).kind == SQLID } )
     <CURRENT> (<SCHEMA> | <SQLID>)
     {
@@ -11198,9 +10672,6 @@ DB2DefaultOption(String columnName) throws StandardException :
                                               parserContext);
     }
 |
-    /* Revert DB2 restriction: DERBY-3013. Accept standard SQL CURRENT_USER,
-     * SESSION_USER in addition to USER.
-     */
     value = userNode()
     {
         return value;
@@ -11211,39 +10682,12 @@ DB2DefaultOption(String columnName) throws StandardException :
         return value;
     }
 |
-    LOOKAHEAD( { getToken(1).kind == DATE || 
-                             getToken(1).kind == TIME || 
-                             getToken(1).kind == TIMESTAMP } )
+    LOOKAHEAD( { miscBuiltinFollows() } )
     value = miscBuiltins()
-    { // these functions are allowed as valid <cast-function> defaults.
-        // Once "BLOB" is allowed as a cast-function (5281), a case should be
-        // added for that, as well.
-        return value;
-    }
-|
-    LOOKAHEAD( { getToken(2).kind == LEFT_PAREN ||
-                                 (getToken(4).kind == LEFT_PAREN && getToken(2).kind != COMMA) } )
-        // Check against comma: see Derby-331 
-        // Before adding this, the following was erroneously
-        // flagged as invalid: 
-        //       create table foo(.., b int default 0, unique (a))
-    value = miscBuiltins()
-    {
-        // If we have a function (as indicated by an open paren,
-        // which can be either the 2nd token (w/ normal function name)
-        // or the 4th token (w/ qualified function name)), then
-        // it's not valid.  Catch it here and throw an "invalid
-        // default" error (42894) instead of letting it go as
-        // a syntax error (this matches DB2 UDB behavior).
-        throw new StandardException("Invalid default for " + columnName);
-    }
-|
-    value = datetimeValueFunction()
     {
         return value;
     }
 |
-    // Only (valid) thing left is literals (i.e. actual constants).
     value = literal()
     {
         return value;
@@ -11616,14 +11060,21 @@ string() throws StandardException :
     {
         parserContext.checkStringLiteralLengthLimit(tok.image);
         /* Trim off the leading and trailing ', and compress all '' to ' */
-        return trimAndCompressQuotes(tok.image, SINGLEQUOTES, false);
+        return trimAndCompressQuotes(tok.image, 1, false);
     }
 |
     tok = <DOUBLEQUOTED_STRING>
     {
         parserContext.checkStringLiteralLengthLimit(tok.image);
-        /* Trim off the leading and trailing ', and compress all '' to ' */
-        return trimAndCompressQuotes(tok.image, DOUBLEQUOTES, true);
+        /* Trim off the leading and trailing ", compress all "" to " and unescape \ */
+        return trimAndCompressQuotes(tok.image, 1, true);
+    }
+|
+    tok = <ESCAPEQUOTED_STRING>
+    {
+        parserContext.checkStringLiteralLengthLimit(tok.image);
+        /* Trim off the leading and trailing ', compress all '' to ' and unescape \ */
+        return trimAndCompressQuotes(tok.image, 2, true);
     }
 |
     tok = <DOUBLEDOLLAR_STRING>
@@ -11660,13 +11111,19 @@ getStringLiteral() throws StandardException :
     tok = <SINGLEQUOTED_STRING>
     {
         parserContext.checkStringLiteralLengthLimit(tok.image);
-        string = trimAndCompressQuotes(tok.image, SINGLEQUOTES, false);
+        string = trimAndCompressQuotes(tok.image, 1, false);
     }
 |
     tok = <DOUBLEQUOTED_STRING>
     {
         parserContext.checkStringLiteralLengthLimit(tok.image);
-        string = trimAndCompressQuotes(tok.image, DOUBLEQUOTES, true);
+        string = trimAndCompressQuotes(tok.image, 1, true);
+    }
+|
+    tok = <ESCAPEQUOTED_STRING>
+    {
+        parserContext.checkStringLiteralLengthLimit(tok.image);
+        string = trimAndCompressQuotes(tok.image, 2, true);
     }
 )
     {
@@ -11882,20 +11339,35 @@ renameColumnStatement() throws StandardException :
 {
     String newColumnName;
     ColumnReference oldColumnReference;
+    TableElementList tableElementList;
+    TableName tableName;
+    ExistenceCheck cond;
 }
 {
-    <COLUMN> oldColumnReference = columnReference()
+    <COLUMN>
+    cond = existsCondition()
+    oldColumnReference = columnReference()
     <TO> newColumnName = identifier()
     {
-        if (oldColumnReference.getTableNameNode() == null)
+        if ((tableName = oldColumnReference.getTableNameNode()) == null)
             throw new StandardException("Table name missing in RENAME COLUMN");
-        return (StatementNode)nodeFactory.getNode(NodeTypes.RENAME_NODE,
-                                                  oldColumnReference.getTableNameNode(),
-                                                  oldColumnReference.getColumnName(),
-                                                  newColumnName,
-                                                  Boolean.FALSE,
-                                                  RenameNode.RenameType.COLUMN,
-                                                  parserContext);
+
+        tableElementList = (TableElementList)nodeFactory
+                    .getNode(NodeTypes.TABLE_ELEMENT_LIST, parserContext);
+
+        tableElementList.addTableElement((TableElementNode)nodeFactory
+                    .getNode(NodeTypes.AT_RENAME_COLUMN_NODE,
+                             oldColumnReference.getColumnName(),
+                             newColumnName,
+                             parserContext));
+
+        return (StatementNode)nodeFactory.getNode(NodeTypes.ALTER_TABLE_NODE,
+                                                  tableName,
+                                                  tableElementList,
+                                                  new int[] {DDLStatementNode.MODIFY_TYPE},
+                                                  new int[] {0},
+                                                  cond,
+                                                  parserContext);  
     }
 }
 
@@ -12086,20 +11558,29 @@ levelOfIsolation() :
     {
         return IsolationLevel.SERIALIZABLE_ISOLATION_LEVEL;
     }
+|
+    <SNAPSHOT>
+    {
+        return IsolationLevel.SNAPSHOT_ISOLATION_LEVEL;
+    }
 }
 
 IsolationLevel
 levelOfIsolationRead() :
-{}
+{
+    boolean snapshot = false;
+}
 {
     <UNCOMMITTED> 
     {
         return IsolationLevel.READ_UNCOMMITTED_ISOLATION_LEVEL;
     }
 |
-    <COMMITTED> 
+    <COMMITTED>
+    [ <NO> <SNAPSHOT> { snapshot = true; } ]
     {
-        return IsolationLevel.READ_COMMITTED_ISOLATION_LEVEL;
+        return snapshot ? IsolationLevel.READ_COMMITTED_NO_SNAPSHOT_ISOLATION_LEVEL
+                        : IsolationLevel.READ_COMMITTED_ISOLATION_LEVEL;
     }
 }
 
@@ -12323,19 +11804,92 @@ transactionAccessMode() throws StandardException :
 }
 
 StatementNode
+setConstraintsStatement() throws StandardException :
+{
+    boolean all = false;
+    TableNameList constraints = null;
+    boolean deferred;
+}
+{
+    <CONSTRAINTS>
+(
+    <ALL>
+    {
+        all = true;
+    }
+|
+    constraints = qualifiedNameList()
+)
+(
+    <DEFERRED> { deferred = true; }
+|
+    <IMMEDIATE> { deferred = false; }
+)
+    {
+        return (StatementNode)nodeFactory.getNode(NodeTypes.SET_CONSTRAINTS_NODE,
+                                                  all, constraints, deferred,
+                                                  parserContext);
+    }
+}
+
+StatementNode
 setConfigurationStatement() throws StandardException :
 {
     Token variable;
-    CharConstantNode value = null;
+    String value = null;
 }
 {
     variable = <IDENTIFIER>
     ( <EQUALS_OPERATOR> | <TO> )
-    ( value = stringLiteral() | <_DEFAULT> )
+    value = configurationValue()
     {
         return (StatementNode)nodeFactory.getNode(NodeTypes.SET_CONFIGURATION_NODE,
-                                                  variable.image, 
-                                                  (value == null) ? null : value.getValue(),
+                                                  variable.image, value,
+                                                  parserContext);
+    }
+}
+
+String
+configurationValue() throws StandardException :
+{
+    CharConstantNode literal;
+    Token token;
+}
+{
+    literal = stringLiteral()
+    {
+        return literal.getString();
+    }
+|
+    <_DEFAULT>
+    {
+        return null;
+    }
+|
+    ( token = <IDENTIFIER> | token = <EXACT_NUMERIC> | token = <TRUE> | token = <FALSE> )
+    {
+        return token.image;
+    }
+}
+
+StatementNode
+showStatement() throws StandardException :
+{
+    Token variable;
+    String ident;
+}
+{
+    <SHOW>
+(
+    variable = <IDENTIFIER>
+    { ident = variable.image; }
+|
+    <TRANSACTION> <ISOLATION> <LEVEL>
+    { ident = "transaction_isolation"; }
+)
+    {
+        return (StatementNode)nodeFactory.getNode(NodeTypes.SHOW_CONFIGURATION_NODE,
+                                                  ident, 
                                                   parserContext);
     }
 }
@@ -12358,29 +11912,7 @@ valueSpecification() throws StandardException :
         return value;
     }
 |
-    <NULLIF> <LEFT_PAREN> leftExpression = additiveExpression() 
-    <COMMA> rightExpression = additiveExpression() <RIGHT_PAREN>
-    {
-        // "NULLIF(L, R)" is the same as "L=R ? untyped NULL : L"
-        // An impl assumption here is that Derby can promote CHAR to any comparable datatypes such as numeric
-        ValueNodeList thenElseList = (ValueNodeList)nodeFactory.getNode(NodeTypes.VALUE_NODE_LIST, parserContext);
-
-        //Use untyped null for then clause at this point. At the bind time, we will cast it to the datatype of L 
-        thenElseList.addValueNode((ValueNode)nodeFactory.getNode(NodeTypes.UNTYPED_NULL_CONSTANT_NODE,
-                                                                 parserContext));
-        thenElseList.addValueNode(leftExpression);
-
-        return (ValueNode)nodeFactory.getNode(NodeTypes.CONDITIONAL_NODE,
-                                              (ValueNode)nodeFactory.getNode(NodeTypes.BINARY_EQUALS_OPERATOR_NODE,
-                                                                             leftExpression,
-                                                                             rightExpression,
-                                                                             parserContext),
-                                              thenElseList,
-                                              Boolean.TRUE,//this node is for nullif 
-                                              parserContext);
-    }
-|
-    <CASE> value = whenThenExpression()
+    <CASE> value = caseExpression()
     {
         return value;
     }
@@ -12392,23 +11924,13 @@ caseExpression() throws StandardException :
     ValueNode expr;
 }
 {
-    <END>
-    {
-        ValueNode value = (ValueNode)nodeFactory.getNode(NodeTypes.CAST_NODE,
-                                                         (ValueNode)nodeFactory.getNode(NodeTypes.UNTYPED_NULL_CONSTANT_NODE,
-                                                                                        parserContext),
-                                                         DataTypeDescriptor.getBuiltInDataTypeDescriptor(Types.CHAR, 1),    
-                                                         parserContext);
-        ((CastNode)value).setForExternallyGeneratedCASTnode();
-        return value;
-    }
-|
-    <ELSE> expr = thenElseExpression() <END>
+    LOOKAHEAD ( { getToken(1).kind == WHEN } )
+    expr = whenThenExpression()
     {
         return expr;
     }
 |
-    expr = whenThenExpression()
+    expr = simpleCaseExpression()
     {
         return expr;
     }
@@ -12425,7 +11947,7 @@ whenThenExpression() throws StandardException :
     <WHEN> expr = orExpression(null) 
         ( <OR> expr = orExpression(expr) )*
         <THEN> thenExpr = thenElseExpression()
-    elseExpr = caseExpression()
+    elseExpr = caseElseExpression()
     {
         ValueNodeList thenElseList = (ValueNodeList)nodeFactory.getNode(NodeTypes.VALUE_NODE_LIST, parserContext);
         thenElseList.addValueNode(thenExpr); // then
@@ -12434,7 +11956,6 @@ whenThenExpression() throws StandardException :
         return((ValueNode)nodeFactory.getNode(NodeTypes.CONDITIONAL_NODE,
                                               expr,
                                               thenElseList,
-                                              Boolean.FALSE,
                                               parserContext));
     }
 }
@@ -12448,12 +11969,8 @@ thenElseExpression() throws StandardException :
     LOOKAHEAD ( { getToken(1).kind == NULL } )
     <NULL>
     {
-        ValueNode value = (ValueNode)nodeFactory.getNode(NodeTypes.CAST_NODE,
-                                                         (ValueNode)nodeFactory.getNode(NodeTypes.UNTYPED_NULL_CONSTANT_NODE,
-                                                                                        parserContext),
-                                                         DataTypeDescriptor.getBuiltInDataTypeDescriptor(Types.CHAR, 1),    
+        ValueNode value = (ValueNode)nodeFactory.getNode(NodeTypes.UNTYPED_NULL_CONSTANT_NODE,
                                                          parserContext);
-        ((CastNode)value).setForExternallyGeneratedCASTnode();
         return value;
     }
 |
@@ -12463,22 +11980,91 @@ thenElseExpression() throws StandardException :
     }
 }
 
+ValueNode
+caseElseExpression() throws StandardException :
+{
+    ValueNode expr;
+}
+{
+    <END>
+    {
+        ValueNode value = (ValueNode)nodeFactory.getNode(NodeTypes.UNTYPED_NULL_CONSTANT_NODE,
+                                                         parserContext);
+        return value;
+    }
+|
+    <ELSE> expr = thenElseExpression() <END>
+    {
+        return expr;
+    }
+|
+    expr = whenThenExpression()
+    {
+        return expr;
+    }
+}
+
+ValueNode
+simpleCaseExpression() throws StandardException :
+{
+    ValueNode operand;
+    SimpleCaseNode caseExpr;
+}
+{
+    operand = additiveExpression()
+    {
+        caseExpr = (SimpleCaseNode)nodeFactory.getNode(NodeTypes.SIMPLE_CASE_NODE,
+                                                       operand, 
+                                                       parserContext);
+    }
+    simpleCaseWhenThenExpression(caseExpr)
+    {
+        return caseExpr;
+    }
+}
+
+void
+simpleCaseWhenThenExpression(SimpleCaseNode caseExpr) throws StandardException :
+{
+    ValueNode expr;
+    ValueNode thenExpr;
+    ValueNode elseExpr;
+}
+{
+    <WHEN> expr = additiveExpression()
+    <THEN> thenExpr = thenElseExpression()
+    {
+        caseExpr.addCase(expr, thenExpr);
+    }
+    simpleCaseElseExpression(caseExpr)
+}
+
+void
+simpleCaseElseExpression(SimpleCaseNode caseExpr) throws StandardException :
+{
+    ValueNode expr;
+}
+{
+    <END>
+|
+    <ELSE> expr = thenElseExpression() <END>
+    {
+        caseExpr.setElseValue(expr);
+    }
+|
+    simpleCaseWhenThenExpression(caseExpr)
+}
+
 void
 tableConstraintDefinition(TableElementList tableElementList) throws StandardException :
 {
-    Properties properties = null;
     ConstraintDefinitionNode tcdn;
     TableName constraintName = null;
 }
 {
     [ constraintName = constraintNameDefinition() ] 
     tcdn = tableConstraint(constraintName) 
-    [ properties = propertyList(false) <CHECK_PROPERTIES>]
     {
-        if (properties != null) {
-            tcdn.setProperties(properties);
-        }
-
         tableElementList.addTableElement((TableElementNode)tcdn);
     }
 }
@@ -12489,11 +12075,6 @@ tableConstraint(TableName constraintName) throws StandardException :
     ConstraintDefinitionNode tcdn;
 }
 {
-    tcdn = indexConstraintDefinition(constraintName)
-    {
-        return tcdn;
-    }
-|
     tcdn = uniqueConstraintDefinition(constraintName) 
     {
         return tcdn;
@@ -12510,15 +12091,14 @@ tableConstraint(TableName constraintName) throws StandardException :
     }
 }
 
-ConstraintDefinitionNode
-indexConstraintDefinition(TableName constraintName) throws StandardException : 
+void
+tableIndexDefinition(boolean isUnique, TableElementList tableElementList) throws StandardException :
 {
     boolean groupFormat = hasFeature(SQLParserFeature.GROUPING);
-
     String indexName = null;
     IndexColumnList indexColumnList = null;
     JoinNode.JoinType joinType = null;
-    StorageLocation location = null;
+    StorageFormatNode storage = null;
 }
 {
     <INDEX> [indexName = identifier()]
@@ -12533,17 +12113,18 @@ indexConstraintDefinition(TableName constraintName) throws StandardException :
     <RIGHT_PAREN>
     [ LOOKAHEAD ( { groupFormat && getToken(1).kind == USING } )
       <USING> joinType = joinType() <JOIN> ]
-    [ <AS> location = getLocation() ]
+    [ <STORAGE_FORMAT> storage = storageFormat() ]
     {
-        return (ConstraintDefinitionNode)nodeFactory.getNode(NodeTypes.INDEX_CONSTRAINT_NODE,
-                                                             constraintName,
-                                                             indexColumnList,
-                                                             indexName,
-                                                             joinType,
-                                                             location,
-                                                             parserContext);
+        IndexDefinitionNode indexDef =
+            (IndexDefinitionNode)nodeFactory.getNode(NodeTypes.INDEX_DEFINITION_NODE,
+                                                     isUnique,
+                                                     indexName,
+                                                     indexColumnList,
+                                                     joinType,
+                                                     storage,
+                                                     parserContext);
+        tableElementList.addTableElement(indexDef);
     }
-    
 }
 
 
@@ -12610,35 +12191,47 @@ referentialConstraintDefinition(TableName constraintName) throws StandardExcepti
     TableName referencedTable;
     int[] refActions = { StatementType.RA_NOACTION,
                          StatementType.RA_NOACTION }; //default values
+    FKConstraintDefinitionNode.MatchType[] matchType = { FKConstraintDefinitionNode.MatchType.SIMPLE };
     Token grouping = null;
+    Token not = null;
+    boolean deferrable = false;
+    Token deferred = null;
+    boolean initiallyDeferred = false;
 }
 {
     // NB: GROUPING case must be kept in sync with alterGroup()
     [ LOOKAHEAD ( { groupConstructFollows(GROUPING) } )
       grouping = <GROUPING> ]
     <FOREIGN> <KEY> <LEFT_PAREN> columnNameList(fkRcl) <RIGHT_PAREN>
-    referencedTable = referencesSpecification(refRcl, refActions)
+    referencedTable = referencesSpecification(refRcl, refActions, matchType)
+    [ [ not = <NOT> ] <DEFERRABLE>
+      { deferrable = (not == null); } ]
+    [ <INITIALLY> ( deferred = <DEFERRED> | <IMMEDIATE> )
+      { initiallyDeferred = (deferred != null); } ]
     {
         return (ConstraintDefinitionNode)nodeFactory.getNode(NodeTypes.FK_CONSTRAINT_DEFINITION_NODE,
                                                              constraintName,
                                                              referencedTable,
                                                              fkRcl,
                                                              refRcl,
-                                                             refActions,
+                                                             refActions[0], refActions[1],
+                                                             matchType[0],
                                                              (grouping == null) ? Boolean.FALSE : Boolean.TRUE,
+                                                             deferrable,
+                                                             initiallyDeferred,
                                                              parserContext);
     }
 }
 
 TableName
-referencesSpecification(ResultColumnList rcl, int[] refActions) 
+referencesSpecification(ResultColumnList rcl, int[] refActions, FKConstraintDefinitionNode.MatchType[] matchType)
         throws StandardException :
 {
     TableName tableName = null;
 }
 {
     <REFERENCES> tableName = referencedTableAndColumns(rcl)
-        // not supporting MATCH or referential actions beyond syntax for default
+        [ <MATCH> matchType[0] = matchType() ]
         [ <ON> referentialTriggeredAction(refActions) ]
     {
         return tableName;
@@ -12674,7 +12267,7 @@ updateActions() :
     int action;
 }
 {
-    <UPDATE> action = updateReferentialAction()
+    <UPDATE> action = referentialAction()
     {
         return action;
     }
@@ -12686,29 +12279,14 @@ deleteActions()  :
     int action;
 }
 {
-    <DELETE> action = deleteReferentialAction()
+    <DELETE> action = referentialAction()
     {
         return action;
     }
 }
 
 int
-updateReferentialAction() :
-{}
-{
-    <RESTRICT> 
-    {
-        return StatementType.RA_RESTRICT;
-    }
-| 
-    <NO> <ACTION> 
-    {
-        return StatementType.RA_NOACTION;
-    }
-}
-
-int
-deleteReferentialAction() :
+referentialAction() :
 {}
 {
     <CASCADE> 
@@ -12738,6 +12316,26 @@ deleteReferentialAction() :
         return StatementType.RA_SETDEFAULT;
     }
     )
+}
+
+FKConstraintDefinitionNode.MatchType
+matchType() :
+{}
+{
+    <SIMPLE>
+    {
+        return FKConstraintDefinitionNode.MatchType.SIMPLE;
+    }
+| 
+    <FULL>
+    {
+        return FKConstraintDefinitionNode.MatchType.FULL;
+    }
+| 
+    <PARTIAL>
+    {
+        return FKConstraintDefinitionNode.MatchType.PARTIAL;
+    }
 }
 
 void
@@ -12775,14 +12373,18 @@ columnConstraint(TableName constraintName,
 {
     Token notNull = null;
     ConstraintDefinitionNode.ConstraintType constraintType;
-    Properties properties = null;
     ConstraintDefinitionNode tcdn;
     ResultColumnList refRcl = (ResultColumnList)nodeFactory.getNode(NodeTypes.RESULT_COLUMN_LIST,
                                                                     parserContext);
     TableName referencedTable;
     int[] refActions = {StatementType.RA_NOACTION,
                         StatementType.RA_NOACTION} ; //default: NO ACTION
+    FKConstraintDefinitionNode.MatchType[] matchType = { FKConstraintDefinitionNode.MatchType.SIMPLE };
     Token grouping = null;
+    Token not = null;
+    boolean deferrable = false;
+    Token deferred = null;
+    boolean initiallyDeferred = false;
 }
 {
     [ notNull = <NOT> ] <NULL>
@@ -12798,7 +12400,6 @@ columnConstraint(TableName constraintName,
     //exception if null constraint is defined for this column-level primary 
     //key constraint
     constraintType = uniqueSpecification(columnName)
-    [ properties = propertyList(false) <CHECK_PROPERTIES>]
     {
         ResultColumnList uniqueColumnList = (ResultColumnList)
             nodeFactory.getNode(NodeTypes.RESULT_COLUMN_LIST,
@@ -12813,7 +12414,7 @@ columnConstraint(TableName constraintName,
                                                              constraintName,
                                                              constraintType,
                                                              uniqueColumnList,
-                                                             properties,
+                                                             null /*properties*/,
                                                              null,
                                                              null,
                                                              parserContext);
@@ -12821,8 +12422,12 @@ columnConstraint(TableName constraintName,
 |    
     [ LOOKAHEAD ( { groupConstructFollows(GROUPING) } )
       grouping = <GROUPING> ]
-    referencedTable = referencesSpecification(refRcl, refActions)
-    [ properties = propertyList(false)<CHECK_PROPERTIES>] 
+    referencedTable = referencesSpecification(refRcl, refActions, matchType)
+    [ LOOKAHEAD ( 2 )
+      [ not = <NOT> ] <DEFERRABLE>
+      { deferrable = (not == null); } ]
+    [ <INITIALLY> ( deferred = <DEFERRED> | <IMMEDIATE> )
+      { initiallyDeferred = (deferred != null); } ]
     {
         ResultColumnList fkRcl = (ResultColumnList)
             nodeFactory.getNode(NodeTypes.RESULT_COLUMN_LIST,
@@ -12836,12 +12441,11 @@ columnConstraint(TableName constraintName,
                                                              referencedTable,
                                                              fkRcl,
                                                              refRcl,
-                                                             refActions,
+                                                             refActions[0], refActions[1],
+                                                             matchType[0],
                                                              (grouping == null) ? Boolean.FALSE : Boolean.TRUE,
+                                                             deferrable, initiallyDeferred,
                                                              parserContext);
-        if (properties != null) {
-            tcdn.setProperties(properties);
-        }
         return tcdn;
     }
 |
@@ -12873,7 +12477,7 @@ dropSchemaStatement() throws StandardException :
     ExistenceCheck cond;
 }
 {
-    <SCHEMA> cond = dropCondition() schemaName = identifier() dropBehavior(behavior)
+    <SCHEMA> cond = existsCondition() schemaName = identifier() dropBehavior(behavior)
     {
         StatementNode stmt = (StatementNode)nodeFactory.getNode(NodeTypes.DROP_SCHEMA_NODE,
                                                                 schemaName,
@@ -12894,9 +12498,11 @@ alterGroup() throws StandardException :
     ResultColumnList parentColumns = null;
     TableElementList tableElementList = (TableElementList)
         nodeFactory.getNode(NodeTypes.TABLE_ELEMENT_LIST, parserContext);
-
+    ExistenceCheck cond;
 }
 {
+    cond = existsCondition()
+    (
     <ADD> <TABLE> childTable = qualifiedName()
     <LEFT_PAREN> childColumns = tableColumnList() <RIGHT_PAREN>
     <TO> parentTable = qualifiedName()
@@ -12914,20 +12520,22 @@ alterGroup() throws StandardException :
                                  parentTable,
                                  childColumns,
                                  parentColumns,
-                                 new int[] {StatementType.RA_NOACTION,StatementType.RA_NOACTION},
-                                 Boolean.TRUE,
+                                 StatementType.RA_NOACTION, StatementType.RA_NOACTION,
+                                 FKConstraintDefinitionNode.MatchType.SIMPLE,
+                                 Boolean.TRUE, Boolean.FALSE, Boolean.FALSE,
                                  parserContext));
 
         return (StatementNode)nodeFactory.getNode(NodeTypes.ALTER_TABLE_NODE,
                                                   childTable,
                                                   tableElementList,
-                                                  new Character('\0'),
                                                   new int[] {DDLStatementNode.ADD_TYPE},
                                                   new int[]{0}, // not used
+                                                  cond,
                                                   parserContext);
     }
 |
-    <DROP> <TABLE> childTable = qualifiedName()
+    <DROP> <TABLE>
+    childTable = qualifiedName()
     {
         // NB: Must be kept in sync with dropTableConstraintDefinition()
         // Equivalent to this statement:
@@ -12939,17 +12547,19 @@ alterGroup() throws StandardException :
                                 ConstraintDefinitionNode.ConstraintType.DROP,
                                 StatementType.DROP_DEFAULT,
                                 Boolean.TRUE,
+                                cond,
                                 parserContext));
 
          return (StatementNode)nodeFactory.getNode(NodeTypes.ALTER_TABLE_NODE,
                                                    childTable,
                                                    tableElementList,
-                                                   new Character('\0'),
                                                    new int[]{DDLStatementNode.DROP_TYPE},
                                                    new int[]{StatementType.DROP_DEFAULT},
+                                                   cond,
                                                    parserContext);
         
     }
+    )
 }
 
 StatementNode
@@ -12959,7 +12569,7 @@ alterStatement() throws StandardException :
     TableName tableName;
 }
 {
-    <TABLE> tableName = qualifiedName() node = alterTableBody(tableName)
+    <TABLE> node = alterTableBody()
     {
         return node;
     }
@@ -13036,10 +12646,11 @@ alterSessionID() throws StandardException:
 }
 
 StatementNode
-alterTableBody(TableName tableName) throws StandardException :
+alterTableBody() throws StandardException :
 {
+    TableName tableName;
+    ExistenceCheck cond;
     StatementNode sn;
-    char lockGranularity = '\0';
     String newTableName;
     TableElementList tableElementList = (TableElementList)
         nodeFactory.getNode(NodeTypes.TABLE_ELEMENT_LIST, parserContext);
@@ -13048,12 +12659,15 @@ alterTableBody(TableName tableName) throws StandardException :
     String indexName = null;
 }
 {
+    cond = existsCondition()
+    tableName = qualifiedName()
+    (
 //insert special key before compress so that only internal SP can know
     <COMPRESS>
     (
-        sn = inplaceCompress(tableName)
+        sn = inplaceCompress(tableName, cond)
     |
-        sn = sequentialCompress(tableName)
+        sn = sequentialCompress(tableName, cond)
     )
     {
         return sn;
@@ -13068,7 +12682,8 @@ alterTableBody(TableName tableName) throws StandardException :
         return (StatementNode)nodeFactory.getNode(NodeTypes.ALTER_TABLE_NODE,
                                                   tableName,
                                                   Boolean.TRUE,
-                                                  null,
+                                                  null, /* index name */
+                                                  cond,
                                                   parserContext);
     }
 |
@@ -13085,6 +12700,7 @@ alterTableBody(TableName tableName) throws StandardException :
                                                   tableName,
                                                   Boolean.FALSE,
                                                   indexName,
+                                                  cond,
                                                   parserContext);
     }
 |
@@ -13093,15 +12709,16 @@ alterTableBody(TableName tableName) throws StandardException :
         return (StatementNode)nodeFactory.getNode(NodeTypes.ALTER_TABLE_NODE,
                                                   tableName,
                                                   tableElementList,
-                                                  new Character(lockGranularity), // Not used, but we kind of nned it
-                                                  changeType,                     // to make the method take 5 args
-                                                  behavior,                       // The one that takes 4 args does
-                                                  parserContext);                 // something else!
+                                                  changeType,
+                                                  behavior,
+                                                  cond,
+                                                  parserContext);
     }
+    )
 }
 
 StatementNode
-inplaceCompress(TableName tableName) throws StandardException :
+inplaceCompress(TableName tableName, ExistenceCheck cond) throws StandardException :
 {
     Token purge = null;
     Token defragment = null;
@@ -13120,12 +12737,13 @@ inplaceCompress(TableName tableName) throws StandardException :
                                                   new Boolean(purge != null),
                                                   new Boolean(defragment != null),
                                                   new Boolean(truncate != null),
+                                                  cond,
                                                   parserContext);
     }
 }
 
 StatementNode
-sequentialCompress(TableName tableName) throws StandardException :
+sequentialCompress(TableName tableName, ExistenceCheck cond) throws StandardException :
 {
     Token tok = null;
 }
@@ -13135,6 +12753,7 @@ sequentialCompress(TableName tableName) throws StandardException :
         return (StatementNode)nodeFactory.getNode(NodeTypes.ALTER_TABLE_NODE,
                                                   tableName,
                                                   new Boolean(tok != null),
+                                                  cond,
                                                   parserContext);
     }
 }
@@ -13149,6 +12768,7 @@ alterTableAction(TableElementList tableElementList, int[] changeType, int[] beha
     DataTypeDescriptor  typeDescriptor;
     Token tok = null;
     String name;
+    String newCName;
     TableName newName;
     long[] autoIncrementInfo = new long[4];
 }
@@ -13191,12 +12811,27 @@ alterTableAction(TableElementList tableElementList, int[] changeType, int[] beha
         tableElementList.addTableElement(tableElement);
     }
 |
-    <RENAME> [<TO> | <AS>] newName = qualifiedName()
+    <RENAME>
+    (
+        LOOKAHEAD ( {getToken(1).kind == COLUMN} )
+        <COLUMN> name = identifier() [<TO> | <AS>] newCName = identifier()
+        {
+            tableElement = (TableElementNode)nodeFactory.getNode(NodeTypes.AT_RENAME_COLUMN_NODE,
+                                                                 name,
+                                                                 newCName,
+                                                                 parserContext);
+        }
+    |
+        [<TABLE>] [<TO> | <AS>] newName = qualifiedName()
+        {
+            tableElement = (TableElementNode)nodeFactory.getNode(NodeTypes.AT_RENAME_NODE,
+                                                                 newName,
+                                                                 parserContext);
+        }
+    )
     {
+
         changeType[0] = DDLStatementNode.MODIFY_TYPE;
-        tableElement = (TableElementNode)nodeFactory.getNode(NodeTypes.AT_RENAME_NODE,
-                                                             newName,
-                                                             parserContext);
         tableElementList.addTableElement(tableElement);
     }
 }
@@ -13204,21 +12839,25 @@ alterTableAction(TableElementList tableElementList, int[] changeType, int[] beha
 /*
  * Handle
  *
- *      ALTER TABLE tablename DROP [ COLUMN ] columnname [ CASCADE | RESTRICT ]
+ *      ALTER TABLE tablename DROP [ COLUMN ] [ IF EXISTS ] columnname [ CASCADE | RESTRICT ]
  */
 TableElementNode
 dropColumnDefinition(int []behavior) throws StandardException :
 {
     String columnName;
     TableElementNode tableElement;
+    ExistenceCheck cond;
 }
 {
-    [ <COLUMN> ] columnName = identifier()
+    [ <COLUMN> ]
+    cond = existsCondition()
+    columnName = identifier()
     dropBehavior(behavior)
     {
         return (TableElementNode)nodeFactory.getNode(NodeTypes.DROP_COLUMN_NODE,
                                                      columnName, null,
                                                      null, null,
+                                                     cond,
                                                      parserContext);
     }
 }
@@ -13230,7 +12869,7 @@ dropIndex() throws StandardException :
     ExistenceCheck cond;
 }
 {
-    (<INDEX> | <KEY>) cond = dropCondition() indexName = identifier()
+    (<INDEX> | <KEY>) cond = existsCondition() indexName = identifier()
     {
         return (TableElementNode)nodeFactory.getNode(NodeTypes.AT_DROP_INDEX_NODE,
                                                      indexName, // name
@@ -13239,65 +12878,59 @@ dropIndex() throws StandardException :
     }
 }
 
-StorageLocation
-getLocation() throws StandardException :
+void
+addIndex(TableElementList tableElementList) throws StandardException :
 {
+    Boolean isUnique = false;
 }
 {
-    <IN_MEMORY>
+    [ isUnique = unique() ]
+    tableIndexDefinition(isUnique, tableElementList)
+}
+
+StorageFormatNode
+storageFormat() throws StandardException :
+{
+    String format;
+    StorageFormatNode storage;
+}
+{
+    <_DEFAULT>
     {
-        return StorageLocation.IN_MEMORY;
+        return null;
     }
 |
-    <BTREE>
+    format = identifier()
     {
-        return StorageLocation.BTREE;
+        storage = (StorageFormatNode)nodeFactory.getNode(NodeTypes.STORAGE_FORMAT_NODE,
+                                                         format,
+                                                         parserContext);
+    }
+    [ <LEFT_PAREN> storageFormatOptions(storage) <RIGHT_PAREN> ]
+    {
+        return storage;
     }
 }
 
 void
-addIndex(TableElementList tableElementList) throws StandardException :
+storageFormatOptions(StorageFormatNode storage) throws StandardException :
+{}
 {
-    boolean groupFormat = hasFeature(SQLParserFeature.GROUPING);
+    storageFormatOption(storage)
+    ( <COMMA> storageFormatOption(storage) )*
+}
 
-    ExistenceCheck cond;
-    Boolean unique = Boolean.FALSE;
-    String indexName;
-    IndexColumnList indexColumnList = null;
-    JoinNode.JoinType joinType = null;
-    Properties properties = null;
-    StorageLocation location = null;
+void
+storageFormatOption(StorageFormatNode storage) throws StandardException :
+{
+    String key;
+    String value;
 }
 {
-    
-    [unique = unique()]
-    <INDEX>
-    cond = createCondition()
-    indexName = identifier()
-     <LEFT_PAREN>
-    ( LOOKAHEAD ( { groupFormat } )
-      groupIndexItemList(indexColumnList = (IndexColumnList)nodeFactory.getNode(NodeTypes.INDEX_COLUMN_LIST, parserContext))
-    |
-      LOOKAHEAD ( { !groupFormat } )
-      indexItemList(indexColumnList = (IndexColumnList)nodeFactory.getNode(NodeTypes.INDEX_COLUMN_LIST, parserContext))
-    )
-    <RIGHT_PAREN>
-    [ LOOKAHEAD ( { groupFormat && getToken(1).kind == USING } )
-      <USING> joinType = joinType() <JOIN> ]
-    [ properties = propertyList(false) <CHECK_PROPERTIES>]
-    [ <AS> location = getLocation() ]
+    key = identifier()
+    [ <EQUALS_OPERATOR> ] value = configurationValue()
     {
-        
-        tableElementList.addTableElement((TableElementNode)nodeFactory.getNode
-                                                                (NodeTypes.AT_ADD_INDEX_NODE,
-                                                                 cond,
-                                                                 unique,
-                                                                 indexName,
-                                                                 indexColumnList,
-                                                                 joinType,
-                                                                 properties,
-                                                                 location,
-                                                                 parserContext));
+        storage.addOption(key, value);
     }
 }
 
@@ -13396,7 +13029,9 @@ columnAlterClause(String columnName) throws StandardException :
     }
 |
     LOOKAHEAD( { getToken(1).kind == WITH || getToken(1).kind == _DEFAULT ||
-                                 (getToken(1).kind == SET && getToken(2).kind == _DEFAULT) } )
+                 getToken(1).kind == GENERATED ||
+                (getToken(1).kind == SET && (getToken(2).kind == _DEFAULT ||
+                                             getToken(2).kind == GENERATED)) } )
     [<SET>] defaultNode = defaultClause(autoIncrementInfo, columnName)
     {
         return wrapAlterColumnDefaultValue(defaultNode,
@@ -13445,10 +13080,13 @@ dropTableConstraintDefinition() throws StandardException :
 {
     TableName constraintName = null;
     Token grouping = null;
+    ExistenceCheck cond;
 }
 {
     LOOKAHEAD( { getToken(1).kind == CONSTRAINT } )
-    <CONSTRAINT> constraintName = qualifiedName()
+    <CONSTRAINT>
+    cond = existsCondition()
+    constraintName = qualifiedName()
     {
         return (TableElementNode)nodeFactory.getNode(NodeTypes.CONSTRAINT_DEFINITION_NODE,
                                                      constraintName,
@@ -13458,11 +13096,13 @@ dropTableConstraintDefinition() throws StandardException :
                                                      null,
                                                      null,
                                                      StatementType.DROP_DEFAULT,
+                                                     cond,
                                                      parserContext);
     }
 |
     LOOKAHEAD( { getToken(1).kind == PRIMARY } )
     <PRIMARY> <KEY>
+    cond = existsCondition()
     {
         return (TableElementNode)nodeFactory.getNode(NodeTypes.CONSTRAINT_DEFINITION_NODE,
                                                      null,
@@ -13473,24 +13113,31 @@ dropTableConstraintDefinition() throws StandardException :
                                                      null,
                                                      StatementType.DROP_DEFAULT,
                                                      ConstraintDefinitionNode.ConstraintType.PRIMARY_KEY,
+                                                     cond,
                                                      parserContext);
     }
 |
     // NB: GROUPING case needs to be kept in sync with alterGroup()!
     LOOKAHEAD( { (getToken(1).kind == FOREIGN) || 
                  (groupConstructFollows(GROUPING) && (getToken(2).kind == FOREIGN)) } )
-    [ grouping = <GROUPING> ] <FOREIGN> <KEY> [ constraintName = qualifiedName() ]
+    [ grouping = <GROUPING> ]
+    <FOREIGN> <KEY>
+    cond = existsCondition()
+    [ constraintName = qualifiedName() ]
     {
         return (TableElementNode)nodeFactory.getNode(NodeTypes.FK_CONSTRAINT_DEFINITION_NODE,
                                                      constraintName,
                                                      ConstraintDefinitionNode.ConstraintType.DROP,
                                                      StatementType.DROP_DEFAULT,
                                                      (grouping == null) ? Boolean.FALSE : Boolean.TRUE,
+                                                     cond,
                                                      parserContext);
     }
 |
     LOOKAHEAD( { getToken(1).kind == UNIQUE } )
-    <UNIQUE> constraintName = qualifiedName()
+    <UNIQUE>
+    cond = existsCondition()
+    constraintName = qualifiedName()
     {
         return (TableElementNode)nodeFactory.getNode(NodeTypes.CONSTRAINT_DEFINITION_NODE,
                                                      constraintName,
@@ -13501,10 +13148,13 @@ dropTableConstraintDefinition() throws StandardException :
                                                      null,
                                                      StatementType.DROP_DEFAULT,
                                                      ConstraintDefinitionNode.ConstraintType.UNIQUE,
+                                                     cond,
                                                      parserContext);
     }
 |
-    <CHECK> constraintName = qualifiedName()
+    <CHECK>
+    cond = existsCondition()
+    constraintName = qualifiedName()
     {
         return (TableElementNode)nodeFactory.getNode(NodeTypes.CONSTRAINT_DEFINITION_NODE,
                                                      constraintName,
@@ -13515,6 +13165,7 @@ dropTableConstraintDefinition() throws StandardException :
                                                      null,
                                                      StatementType.DROP_DEFAULT,
                                                      ConstraintDefinitionNode.ConstraintType.CHECK,
+                                                     cond,
                                                      parserContext);
     }
 }
@@ -13527,7 +13178,7 @@ dropTableStatement() throws StandardException :
     ExistenceCheck cond;
 }
 {
-    <TABLE> cond = dropCondition() tableName = qualifiedName() dropBehavior(behavior)
+    <TABLE> cond = existsCondition() tableName = qualifiedName() dropBehavior(behavior)
     {
         return (StatementNode)nodeFactory.getNode(NodeTypes.DROP_TABLE_NODE,
                                                   tableName,
@@ -13545,7 +13196,7 @@ dropIndexStatement() throws StandardException :
     ExistenceCheck cond;
 }
 {
-    <INDEX> cond = dropCondition() indexName = indexName(tableName)
+    <INDEX> cond = existsCondition() indexName = indexName(tableName)
     {
         return (StatementNode)nodeFactory.getNode(NodeTypes.DROP_INDEX_NODE,
                                                   tableName[0],
@@ -13562,22 +13213,22 @@ dropAliasStatement() throws StandardException :
     ExistenceCheck cond;
 }
 {
-    <PROCEDURE> cond = dropCondition() aliasName = qualifiedName() 
+    <PROCEDURE> cond = existsCondition() aliasName = qualifiedName()
     {
         return dropAliasNode(aliasName, AliasInfo.Type.PROCEDURE, cond);
     }    
 |        
-    <FUNCTION> cond = dropCondition() aliasName = qualifiedName() 
+    <FUNCTION> cond = existsCondition() aliasName = qualifiedName()
     {
         return dropAliasNode(aliasName, AliasInfo.Type.FUNCTION, cond);
     }    
 |    
-    <SYNONYM> cond = dropCondition() aliasName = qualifiedName()
+    <SYNONYM> cond = existsCondition() aliasName = qualifiedName()
     {
         return dropAliasNode(aliasName, AliasInfo.Type.SYNONYM, cond);
     }
 |    
-    <TYPE> cond = dropCondition() aliasName = qualifiedName() <RESTRICT>
+    <TYPE> cond = existsCondition() aliasName = qualifiedName() <RESTRICT>
     {
         return dropAliasNode(aliasName, AliasInfo.Type.UDT, cond);
     }
@@ -13590,7 +13241,7 @@ dropViewStatement() throws StandardException :
     ExistenceCheck cond;
 }
 {
-    <VIEW> cond = dropCondition() viewName = qualifiedName() 
+    <VIEW> cond = existsCondition() viewName = qualifiedName()
     {
         return (StatementNode)nodeFactory.getNode(NodeTypes.DROP_VIEW_NODE,
                                                   viewName,
@@ -13606,7 +13257,7 @@ dropGroupStatement() throws StandardException :
     ExistenceCheck cond;
 }
 {
-    <GROUP> cond = dropCondition() groupName = qualifiedName()
+    <GROUP> cond = existsCondition() groupName = qualifiedName()
     {
         return (StatementNode)nodeFactory.getNode(NodeTypes.DROP_GROUP_NODE,
                                                    groupName,
@@ -13638,6 +13289,8 @@ truncateStatement() throws StandardException :
     <TRUNCATE>
 (
     statementNode = truncateTableStatement()
+|
+    statementNode = truncateGroupStatement()
 )
     {
         return statementNode;
@@ -13648,12 +13301,39 @@ StatementNode
 truncateTableStatement() throws StandardException :
 {
     TableName tableName;
+    int[] behavior = new int[1];
+    ExistenceCheck cond;
 }
 {
-    <TABLE> tableName = qualifiedName() 
+    <TABLE>
+    cond = existsCondition()
+    tableName = qualifiedName()
+    dropBehavior(behavior)
     {
         return (StatementNode)nodeFactory.getNode(NodeTypes.ALTER_TABLE_NODE,
                                                   tableName,
+                                                  behavior,
+                                                  cond,
+                                                  parserContext);
+    }
+}
+
+StatementNode
+truncateGroupStatement() throws StandardException :
+{
+    TableName groupName;
+    ExistenceCheck cond;
+}
+{
+    <GROUP>
+    cond = existsCondition()
+    groupName = qualifiedName()
+    {
+        // Turns into DROP TABLE g CASCADE
+        return (StatementNode)nodeFactory.getNode(NodeTypes.ALTER_TABLE_NODE,
+                                                  groupName,
+                                                  new int[] { StatementType.DROP_CASCADE },
+                                                  cond,
                                                   parserContext);
     }
 }
@@ -14165,10 +13845,8 @@ cursorStatement() throws StandardException :
     }
 |
     <PREPARE> name = identifier()
-    <AS> stmt = proceduralStatement(tokenHolder)
+    <AS> stmt = preparableStatement(tokenHolder)
     {
-        stmt.setBeginOffset(tokenHolder[0].beginOffset);
-        stmt.setEndOffset(getToken(0).endOffset);
         return (StatementNode)nodeFactory.getNode(NodeTypes.PREPARE_STATEMENT_NODE,
                                                   name, stmt,
                                                   parserContext);
@@ -14180,6 +13858,23 @@ cursorStatement() throws StandardException :
         return (StatementNode)nodeFactory.getNode(NodeTypes.DEALLOCATE_STATEMENT_NODE,
                                                   name,
                                                   parserContext);
+    }
+}
+
+StatementNode
+preparableStatement(Token[] tokenHolder) throws StandardException :
+{
+    StatementNode stmt;
+    boolean wereParametersAllowed = parametersAllowed;
+    parametersAllowed = true;
+}
+{
+    stmt = proceduralStatement(tokenHolder)
+    {
+        stmt.setBeginOffset(tokenHolder[0].beginOffset);
+        stmt.setEndOffset(getToken(0).endOffset);
+        parametersAllowed = wereParametersAllowed;
+        return stmt;
     }
 }
 
@@ -14228,12 +13923,15 @@ explainStatement() throws StandardException :
     StatementNode stmt;
     Token[] tokenHolder = new Token[1];
     ExplainStatementNode.Detail detail = ExplainStatementNode.Detail.NORMAL;
+    boolean wereParametersAllowed = parametersAllowed;
 }
 {
     <EXPLAIN> 
+    { parametersAllowed = true; }
     [ detail = explainDetail() ]
     stmt = declarableStatement(tokenHolder)
     {
+        parametersAllowed = wereParametersAllowed;
         return (StatementNode)nodeFactory.getNode(NodeTypes.EXPLAIN_STATEMENT_NODE,
                                                   stmt, detail,
                                                   parserContext);
@@ -14312,6 +14010,7 @@ copyOption(CopyStatementNode stmt) throws StandardException :
 {
     String value;
     long lvalue;
+    int ivalue;
     CopyStatementNode.Format format;
 }
 {
@@ -14353,6 +14052,11 @@ copyOption(CopyStatementNode stmt) throws StandardException :
     <COMMIT> lvalue = exactNumber() [<ROWS>]
     {
         stmt.setCommitFrequency(lvalue);
+    }
+|
+    <RETRY> ivalue = uint_value()
+    {
+        stmt.setMaxRetries(ivalue);
     }
 }
 
@@ -14410,8 +14114,6 @@ identifier() throws StandardException :
 }
 
 // Same as above, but without length check, which caller will perform.
-// This avoids errors too soon from Java name components that are too
-// long to be SQL identifier components.
 String
 identifierDeferCheckLength() throws StandardException :
 {
@@ -14425,7 +14127,7 @@ identifierDeferCheckLength() throws StandardException :
 }
 
 String
-delimitedIdentifier() :
+delimitedIdentifier() throws StandardException :
 {
     String str;
     Token tok;
@@ -14435,12 +14137,12 @@ delimitedIdentifier() :
     tok = <DOUBLEQUOTED_IDENTIFIER>
     {
         // Strip quotes and correct interior ones.
-        str = trimAndCompressQuotes(tok.image, DOUBLEQUOTES, false);
+        str = trimAndCompressQuotes(tok.image, 1, false);
     }
 |
     tok = <BACKQUOTED_IDENTIFIER>
     {
-        str = trimAndCompressQuotes(tok.image, BACKQUOTES, false);
+        str = trimAndCompressQuotes(tok.image, 1, false);
     }
 )
     {
@@ -14450,252 +14152,6 @@ delimitedIdentifier() :
         nextToLastIdentifierToken = lastIdentifierToken;
         lastIdentifierToken = tok;
         return str;
-    }
-}
-
-String
-reservedKeyword() :
-{
-    Token tok;
-}
-{
-    // NOTE: All reserved keywords have to be repeated here so that they
-    // can still be part of a Java name.
-(
-    /* SQL92 reserved keywords */
-  tok = <ADD>
-| tok = <ALL>
-| tok = <ALLOCATE>
-| tok = <ALTER>
-| tok = <AND>
-| tok = <ANY>
-| tok = <ARE>
-| tok = <AS>
-| tok = <ASC>
-| tok = <ASSERTION>
-| tok = <AT>
-| tok = <AUTHORIZATION>
-| tok = <AVG>
-| tok = <BEGIN>
-| tok = <BETWEEN>
-| tok = <BIT>
-| tok = <BOTH>
-| tok = <BY>
-| tok = <CASCADE>
-| tok = <CASCADED>
-| tok = <CASE>
-| tok = <CAST>
-| tok = <CHAR>
-| tok = <CHARACTER>
-| tok = <CHARACTER_LENGTH>
-| tok = <CHAR_LENGTH>
-| tok = <CHECK>
-| tok = <CLOSE>
-| tok = <COLLATE>
-| tok = <COLLATION>
-| tok = <COLUMN>
-| tok = <COMMIT>
-| tok = <CONNECT>
-| tok = <CONNECTION>
-| tok = <CONSTRAINT>
-| tok = <CONSTRAINTS>
-| tok = <CONTINUE>
-| tok = <CONVERT>
-| tok = <CORRESPONDING>
-| tok = <CREATE>
-| tok = <CROSS>
-| tok = <CURRENT>
-| tok = <CURRENT_DATE>
-| tok = <CURRENT_TIME>
-| tok = <CURRENT_TIMESTAMP>
-| tok = <CURRENT_USER>
-| tok = <CURSOR>
-| tok = <DEALLOCATE>
-| tok = <DEC>
-| tok = <DECIMAL>
-| tok = <DECLARE>
-| tok = <_DEFAULT>
-| tok = <DEFERRABLE>
-| tok = <DEFERRED>
-| tok = <DELETE>
-| tok = <DESC>
-| tok = <DESCRIBE>
-| tok = <DIAGNOSTICS>
-| tok = <DISCONNECT>
-| tok = <DISTINCT>
-| tok = <DOUBLE>
-| tok = <DROP>
-| tok = <ELSE>
-| tok = <END>
-| tok = <ENDEXEC>
-| tok = <ESCAPE>
-| tok = <EXCEPT>
-| tok = <EXCEPTION>
-| tok = <EXEC>
-| tok = <EXECUTE>
-| tok = <EXISTS>
-| tok = <EXTERNAL>
-| tok = <FALSE>
-| tok = <FETCH>
-| tok = <FIRST>
-| tok = <FLOAT>
-| tok = <FOR>
-| tok = <FOREIGN>
-| tok = <FOUND>
-| tok = <FROM>
-| tok = <FULL>
-| tok = <FUNCTION>
-| tok = <GET>
-| tok = <GET_CURRENT_CONNECTION>
-| tok = <GLOBAL>
-| tok = <GO>
-| tok = <GOTO>
-| tok = <GRANT>
-| tok = <GROUP>
-| tok = <GROUP_CONCAT>
-| tok = <HAVING>
-| tok = <HOUR>
-| tok = <IDENTITY>
-| tok = <IMMEDIATE>
-| tok = <IN>
-| tok = <INDEX>
-| tok = <INDICATOR>
-| tok = <INITIALLY>
-| tok = <INNER>
-| tok = <INOUT>
-| tok = <INPUT>
-| tok = <INSENSITIVE>
-| tok = <INSERT>
-| tok = <INT>
-| tok = <INTEGER>
-| tok = <INTERSECT>
-| tok = <INTERVAL>
-| tok = <INTO>
-| tok = <IS>
-| tok = <ISOLATION>
-| tok = <JOIN>
-| tok = <KEY>
-| tok = <LAST>
-| tok = <LEADING>
-| tok = <LEFT>
-| tok = <LIKE>
-| tok = <LIMIT>
-| tok = <LOWER>
-| tok = <MATCH>
-| tok = <MAX>
-| tok = <MIN>
-| tok = <MINUTE>
-| tok = <NATIONAL>
-| tok = <NATURAL>
-| tok = <NCHAR>
-| tok = <NVARCHAR> 
-| tok = <NEXT>
-| tok = <NO>
-| tok = <NONE>
-| tok = <NOT>
-| tok = <NULL>
-| tok = <NULLIF>
-| tok = <NUMERIC>
-| tok = <OCTET_LENGTH>
-| tok = <OF>
-| tok = <ON>
-| tok = <ONLY>
-| tok = <OPEN>
-| tok = <OPTION>
-| tok = <OR>
-| tok = <ORDER>
-| tok = <OUT>
-| tok = <OUTER>
-| tok = <OUTPUT>
-| tok = <OVERLAPS>
-| tok = <PAD>
-| tok = <PARTIAL>
-| tok = <PREPARE>
-| tok = <PRESERVE>
-| tok = <PRIMARY>
-| tok = <PRIOR>
-| tok = <PRIVILEGES>
-| tok = <PROCEDURE>
-| tok = <PUBLIC>
-| tok = <READ>
-| tok = <REAL>
-| tok = <REFERENCES>
-| tok = <RELATIVE>
-| tok = <RESTRICT>
-| tok = <RETURNING>
-| tok = <REVOKE>
-| tok = <RIGHT>
-| tok = <ROLLBACK>
-| tok = <ROWS>
-| tok = <SCHEMA>
-| tok = <SCROLL>
-| tok = <SECOND>
-| tok = <SELECT>
-| tok = <SESSION>
-| tok = <SESSION_USER>
-| tok = <SET>
-| tok = <SMALLINT>
-| tok = <SOME>
-| tok = <SPACE>
-| tok = <SQL>
-| tok = <SQLCODE>
-| tok = <SQLERROR>
-| tok = <SQLSTATE>
-| tok = <STRAIGHT_JOIN>
-| tok = <SUBSTRING>
-| tok = <SUM>
-| tok = <SYSTEM_USER>
-| tok = <TABLE>
-| tok = <TEMPORARY>
-| tok = <TIMEZONE_HOUR>
-| tok = <TIMEZONE_MINUTE>
-| tok = <TO>
-| tok = <TRAILING>
-| tok = <TRANSACTION>
-| tok = <TRANSLATE>
-| tok = <TRANSLATION>
-| tok = <TRUE>
-| tok = <UNION>
-| tok = <UNIQUE>
-| tok = <UNKNOWN>
-| tok = <UPDATE>
-| tok = <UPPER>
-| tok = <USER>
-| tok = <USING>
-| tok = <VALUES>
-| tok = <VARCHAR>
-| tok = <VARYING>
-| tok = <VIEW>
-| tok = <WHENEVER>
-| tok = <WHERE>
-| tok = <WITH>
-| tok = <WORK>
-| tok = <WRITE>
-| tok = <YEAR>
-    /* non-SQL92 reserved keywords */
-| tok = <BOOLEAN>
-| tok = <CALL>
-| tok = <CURRENT_ROLE>
-| tok = <CURRENT_SCHEMA>
-| tok = <EXPLAIN>
-| tok = <GROUPING>
-| tok = <LONGINT>
-| tok = <LTRIM>
-| tok = <RTRIM>
-| tok = <TRIM>
-| tok = <SUBSTR>
-| tok = <XML>
-| tok = <XMLPARSE>
-| tok = <XMLSERIALIZE>
-| tok = <XMLEXISTS>
-| tok = <XMLQUERY>
-| tok = <Z_ORDER_LAT_LON>
-)
-    {
-        // Remember whether last token was a delimited identifier
-        nextToLastTokenDelimitedIdentifier = lastTokenDelimitedIdentifier;
-        lastTokenDelimitedIdentifier = Boolean.FALSE;
-        return tok.image;
     }
 }
 
@@ -14713,21 +14169,26 @@ nonReservedKeyword() :
 | tok = <ACTION>
 | tok = <AFTER>
 | tok = <ALWAYS>
+| tok = <ASC> // SQL92 reserved, SQL2003 non-reserved
+| tok = <ASSERTION> // SQL92 reserved, SQL2003 non-reserved
 | tok = <BEFORE>
 | tok = <BINARY>
 | tok = <BLOB>
 | tok = <BRIEF>
-| tok = <BTREE>
 | tok = <C>
 | tok = <CALLED>
+| tok = <CASCADE> // SQL92 reserved, SQL2003 non-reserved
+| tok = <CHARACTER> // SQL92 reserved, SQL2003 non-reserved
 | tok = <CHARACTERISTICS>
 | tok = <CLASS>
 | tok = <CLOB>
 | tok = <COALESCE>
 | tok = <COBOL>
+| tok = <COLLATION> // SQL92 reserved, SQL2003 non-reserved
 | tok = <COMMITTED>
 | tok = <COMPRESS>
 | tok = <CONCAT>
+| tok = <CONSTRAINTS> // SQL92 reserved, SQL2003 non-reserved
 | tok = <CONTAINS>
 | tok = <CONTENT>
 | tok = <COPY>
@@ -14738,6 +14199,7 @@ nonReservedKeyword() :
 | tok = <CURTIME>
 | tok = <D>
 | tok = <DATA>
+| tok = <DATABASE>
 | tok = <DATE>
 | tok = <DATETIME>
 | tok = <DAY>
@@ -14745,41 +14207,53 @@ nonReservedKeyword() :
 | tok = <DAY_MICROSECOND>
 | tok = <DAY_MINUTE>
 | tok = <DAY_SECOND>
+| tok = <DEFERRABLE> // SQL92 reserved, SQL2003 non-reserved
+| tok = <DEFERRED> // SQL92 reserved, SQL2003 non-reserved
 | tok = <DEFRAGMENT>
 | tok = <DELIMITER>
+| tok = <DESC> // SQL92 reserved, SQL2003 non-reserved
+| tok = <DIAGNOSTICS> // SQL92 reserved, SQL2003 non-reserved
 | tok = <DIRTY>
 | tok = <DIV>
+| tok = <DOCUMENT>
 | tok = <DUMMY>
 | tok = <DYNAMIC>
-| tok = <DATABASE>
-| tok = <DB2SQL>
-| tok = <DOCUMENT>
 | tok = <EACH>
 | tok = <EMPTY>
 | tok = <ENCODING>
+| tok = <EXCEPTION> // SQL92 reserved, SQL2003 non-reserved
 | tok = <EXCLUSIVE>
 | tok = <EXTRACT>
+| tok = <FIRST> // SQL92 reserved, SQL2003 non-reserved
 | tok = <FN>
 | tok = <FORCE>
 | tok = <FORMAT>
 | tok = <FORTRAN>
+| tok = <FOUND> // SQL92 reserved, SQL2003 non-reserved
+| tok = <FULL_TEXT>
 | tok = <GENERATED>
+| tok = <GO> // SQL92 reserved, SQL2003 non-reserved
+| tok = <GOTO> // SQL92 reserved, SQL2003 non-reserved
+| tok = <GUID>
 | tok = <HEADER>
 | tok = <HOUR_MICROSECOND>
 | tok = <HOUR_MINUTE>
 | tok = <HOUR_SECOND>
 | tok = <IDENTITY_VAL_LOCAL>
-| tok = <IGNORE>
 | tok = <IF>
-| tok = <IN_MEMORY>
+| tok = <IGNORE>
 | tok = <INCREMENT>
 | tok = <INITIAL>
+| tok = <INITIALLY> // SQL92 reserved, SQL2003 non-reserved
 | tok = <INPLACE>
 | tok = <INTERRUPT>
+| tok = <ISOLATION> // SQL92 reserved, SQL2003 non-reserved
 | tok = <JAVA>
+| tok = <KEY> // SQL92 reserved, SQL2003 non-reserved
 | tok = <KILL>
 | tok = <LANGUAGE>
 | tok = <LARGE>
+| tok = <LAST> // SQL92 reserved, SQL2003 non-reserved
 | tok = <LCASE>
 | tok = <LENGTH>
 | tok = <LEVEL>
@@ -14789,6 +14263,12 @@ nonReservedKeyword() :
 | tok = <LOCKSIZE>
 | tok = <LOGGED>
 | tok = <LONG>
+| tok = <LONGBLOB>
+| tok = <LONGINT>
+| tok = <LONGTEXT>
+| tok = <MEDIUMBLOB>
+| tok = <MEDIUMINT>
+| tok = <MEDIUMTEXT>
 | tok = <MESSAGE_LOCALE>
 | tok = <METHOD>
 | tok = <MICROSECOND>
@@ -14800,8 +14280,8 @@ nonReservedKeyword() :
 | tok = <MODIFY>
 // SQL92 says MODULE is reserved, but we want it to be non-reserved.
 | tok = <MODULE>
-| tok = <MONTH>
 | tok = <_MORE>
+| tok = <MONTH>
 | tok = <MUMPS>
 | tok = <MYSQL_DUMP>
 | tok = <NAME>
@@ -14815,30 +14295,40 @@ nonReservedKeyword() :
 | tok = <OFF>
 | LOOKAHEAD( { getToken(1).kind == OFFSET && !seeingOffsetClause() } )
   tok = <OFFSET>
+| tok = <OJ>
 | tok = <OLD>
 | tok = <OLD_TABLE>
-| tok = <OJ>
+| tok = <OPTION> // SQL92 reserved, SQL2003 non-reserved
 | tok = <OVER>
+| tok = <PAD> // SQL92 reserved, SQL2003 non-reserved
+| tok = <PARTIAL> // SQL92 reserved, SQL2003 non-reserved
 | tok = <PASCAL>
 | tok = <PASSING>
 | tok = <PLI>
 | tok = <POSITION>
 | tok = <PRECISION>
+| tok = <PRESERVE> // SQL92 reserved, SQL2003 non-reserved
+| tok = <PRIOR> // SQL92 reserved, SQL2003 non-reserved
+| tok = <PRIVILEGES> // SQL92 reserved, SQL2003 non-reserved
 | tok = <PROPERTIES>
 | tok = <PURGE>
 | tok = <QUARTER>
 | tok = <_QUOTE>
+| tok = <READ> // SQL92 reserved, SQL2003 non-reserved
 | tok = <READS>
+| tok = <RELATIVE> // SQL92 reserved, SQL2003 non-reserved
 | tok = <REF>
 // SQL92 says RELEASE is reserved, but we want it to be non-reserved.
 | tok = <RELEASE>
 | tok = <RENAME>
 | tok = <REPEATABLE>
+| tok = <REPLACE>
 | tok = <REFERENCING>
 | tok = <RESET>
 | tok = <RESTART>
 | tok = <RESULT>
 | tok = <RETAIN>
+| tok = <RETRY>
 | tok = <RETURNS>
 | tok = <ROLE>
 | tok = <ROLLUP>
@@ -14856,19 +14346,24 @@ nonReservedKeyword() :
 | tok = <SEQUENCE>
 | tok = <SEQUENTIAL>
 | tok = <SERIALIZABLE>
+| tok = <SESSION> // SQL92 reserved, SQL2003 non-reserved
 | tok = <SETS>
 | tok = <SHARE>
+| tok = <SHOW>
 | tok = <SHUTDOWN>
+| tok = <SIMPLE>
+| tok = <SNAPSHOT>
+| tok = <SPACE> // SQL92 reserved, SQL2003 non-reserved
 | tok = <SPECIFIC>
 | tok = <SQLID>
-| tok = <SQL_TSI_FRAC_SECOND>
-| tok = <SQL_TSI_SECOND>
-| tok = <SQL_TSI_MINUTE>
-| tok = <SQL_TSI_HOUR>
 | tok = <SQL_TSI_DAY>
-| tok = <SQL_TSI_WEEK>
+| tok = <SQL_TSI_FRAC_SECOND>
+| tok = <SQL_TSI_HOUR>
+| tok = <SQL_TSI_MINUTE>
 | tok = <SQL_TSI_MONTH>
 | tok = <SQL_TSI_QUARTER>
+| tok = <SQL_TSI_SECOND>
+| tok = <SQL_TSI_WEEK>
 | tok = <SQL_TSI_YEAR>
 | tok = <SQRT>
 | tok = <STABILITY>
@@ -14877,15 +14372,22 @@ nonReservedKeyword() :
 | tok = <STATISTICS>
 | tok = <STDIN>
 | tok = <STDOUT>
+| tok = <STORAGE_FORMAT>
 | tok = <STRIP>
-| tok = <SYNONYM>
 | tok = <STYLE>
+| tok = <SYNONYM>
 | tok = <T>
+| tok = <TEMPORARY> // SQL92 reserved, SQL2003 non-reserved
+| tok = <TEXT>
 | tok = <THEN>
 | tok = <TIME>
 | tok = <TIMESTAMP>
 | tok = <TIMESTAMPADD>
 | tok = <TIMESTAMPDIFF>
+| tok = <TINYBLOB>
+| tok = <TINYINT>
+| tok = <TINYTEXT>
+| tok = <TRANSACTION> // SQL92 reserved, SQL2003 non-reserved
 | tok = <TRIGGER>
 | tok = <TRUNCATE>
 | tok = <TRUNCATE_END>
@@ -14897,6 +14399,9 @@ nonReservedKeyword() :
 | tok = <UR>
 | tok = <USAGE>
 | tok = <USE>
+| tok = <VIEW> // SQL92 reserved, SQL2003 non-reserved
+| tok = <WORK> // SQL92 reserved, SQL2003 non-reserved
+| tok = <WRITE> // SQL92 reserved, SQL2003 non-reserved
 // SQL92 says VALUE is reserved, but we want it to be nonreserved.
 | tok = <VALUE>
 | tok = <VARBINARY>
@@ -14917,95 +14422,80 @@ nonReservedKeyword() :
     }
 }
 
-String
-caseSensitiveIdentifierPlusReservedWords() :
-{
-    String str;
-}
-{
-    str = caseSensitiveIdentifier()
-    {
-        return str;
-    }
-|
-    str = reservedKeyword()
-    {
-        return str;
-    }
-}
-
-String
-caseInsensitiveIdentifierPlusReservedWords() throws StandardException :
-{
-    String str;
-}
-{
-    str = identifier()
-    {
-        return str;
-    }
-|
-    str = reservedKeyword()
-    {
-        return SQLToIdentifierCase(str);
-    }
-}
-
-String
-caseSensitiveIdentifier() :
-{
-    String  str;
-    Token       tok;
-}
-{
-    tok = <IDENTIFIER>
-    {
-        // Remember whether last token was a delimited identifier.
-        nextToLastTokenDelimitedIdentifier = lastTokenDelimitedIdentifier;
-        lastTokenDelimitedIdentifier = Boolean.FALSE;
-        return tok.image;
-    }
-|
-    str = delimitedIdentifier()
-    {
-        return str;
-    }
-|
-    str = nonReservedKeyword()
-    {
-        return str;
-    }
-}
-
 void
 groupIndexItemList(IndexColumnList columnList) throws StandardException :
 {}
 {
+    LOOKAHEAD( { getToken(1).kind == FULL_TEXT && getToken(2).kind == LEFT_PAREN } )
+    fullTextColumnItemList(columnList)
+|
     groupIndexItem(columnList) 
     ( <COMMA> groupIndexItem(columnList) )*
 }
 
 void groupIndexItem(IndexColumnList columnList) throws StandardException :
 {
-    int latPosition;
+    ColumnReference columnReference;
+    String[] nameComponents;
+    int firstFunctionArgPosition;
+    int functionArgCount;
+    boolean asc = true;
 }
 {
-    (
-      <Z_ORDER_LAT_LON>
-      <LEFT_PAREN>
-      { latPosition = columnList.size(); }
-      unorderedGroupIndexColumnItem(columnList)
-      <COMMA>
-      unorderedGroupIndexColumnItem(columnList)
+    nameComponents = groupIndexColumnNameComponents()
+    ( (
+        <LEFT_PAREN>
+        { firstFunctionArgPosition = columnList.size(); }
+        unorderedGroupIndexColumnItem(columnList)
+        { functionArgCount = 1; }
+        [
+          <COMMA>
+          unorderedGroupIndexColumnItem(columnList)
+          { functionArgCount = 2; }
+        ]
+        <RIGHT_PAREN>
+        {
+            String functionName = nameComponents[2];
+            if (nameComponents[1] != null) {
+                functionName = nameComponents[1] + "." + functionName;
+                if (nameComponents[0] != null) {
+                    functionName = nameComponents[0] + "." + functionName;
+                }
+                throw new StandardException(functionName + " is not a valid function for use in index creation DDL.");
+            }
+            columnList.applyFunction(functionName,
+                                     firstFunctionArgPosition,
+                                     functionArgCount);
+        }
+      )
+      |
+      (
+        [ <ASC> | <DESC> { asc = false; } ]        
+        {
+            columnReference = groupIndexColumnNameFromComponents(nameComponents);
+            IndexColumn indexColumn = (IndexColumn)
+                nodeFactory.getNode(NodeTypes.INDEX_COLUMN,
+                                    columnReference.getTableNameNode(),
+                                    columnReference.getColumnName(),
+                                    asc ? Boolean.TRUE : Boolean.FALSE,
+                                    parserContext);
+            columnList.add(indexColumn);
+        }
+      ) )
+}
+
+void fullTextColumnItemList(IndexColumnList columnList) throws StandardException :
+{
+}
+{
+      <FULL_TEXT> <LEFT_PAREN>
+      groupIndexColumnItem(columnList)
+      ( <COMMA> groupIndexColumnItem(columnList) )*
       <RIGHT_PAREN>
       {
-          columnList.applyFunction(IndexColumnList.FunctionType.Z_ORDER_LAT_LON,
-                                   latPosition,
-                                   2);
+          columnList.applyFunction("FULL_TEXT",
+                                   0, columnList.size());
       }
-    )
-    |
-      groupIndexColumnItem(columnList)
 }
 
 void
@@ -15015,7 +14505,7 @@ groupIndexColumnItem(IndexColumnList columnList) throws StandardException :
     ColumnReference groupIndexColumnName;
 }
 {
-    groupIndexColumnName = groupIndexColumnName(columnList)
+    groupIndexColumnName = groupIndexColumnName()
     [ <ASC> | <DESC> { asc = false; } ]
     {
         IndexColumn indexColumn = (IndexColumn)
@@ -15034,7 +14524,7 @@ unorderedGroupIndexColumnItem(IndexColumnList columnList) throws StandardExcepti
     ColumnReference groupIndexColumnName;
 }
 {
-    groupIndexColumnName = groupIndexColumnName(columnList)
+    groupIndexColumnName = groupIndexColumnName()
     {
         IndexColumn indexColumn = (IndexColumn)
             nodeFactory.getNode(NodeTypes.INDEX_COLUMN,
@@ -15047,48 +14537,67 @@ unorderedGroupIndexColumnItem(IndexColumnList columnList) throws StandardExcepti
 }
 
 ColumnReference
-groupIndexColumnName(IndexColumnList columnList) throws StandardException :
+groupIndexColumnName() throws StandardException :
 {
-    String firstName;
-    String secondName = null;
-    String thirdName = null;
+    String[] names;
 }
 {
-    firstName = identifierDeferCheckLength()
-    [ LOOKAHEAD( { getToken(1).kind == PERIOD } )
-      <PERIOD>
-      secondName = identifierDeferCheckLength()
-      [ LOOKAHEAD( { getToken(1).kind == PERIOD } )
-        <PERIOD>
-        thirdName = identifierDeferCheckLength() ] ]
     {
-        if (secondName == null) {
-            thirdName = firstName;
-            firstName = null;
-        }
-        else if (thirdName == null) {
-            thirdName = secondName;
-            secondName = firstName;
-            firstName = null;
-        }
-        if (firstName != null)
-            parserContext.checkIdentifierLengthLimit(firstName);
-        if (secondName != null)
-            parserContext.checkIdentifierLengthLimit(secondName);
-        parserContext.checkIdentifierLengthLimit(thirdName);
+        return groupIndexColumnNameFromComponents(groupIndexColumnNameComponents());
+    }
+}
+
+ColumnReference
+groupIndexColumnNameFromComponents(String[] names) throws StandardException :
+{
+}
+{
+    {
         TableName tableName = null;
-        if (secondName != null)
+        if (names[1] != null)
             tableName = (TableName)nodeFactory.getNode(NodeTypes.TABLE_NAME,
-                                                       firstName,
-                                                       secondName,
+                                                       names[0],
+                                                       names[1],
                                                        new Integer(nextToLastIdentifierToken.beginOffset),
                                                        new Integer(nextToLastIdentifierToken.endOffset),
                                                        parserContext);
         return (ColumnReference)nodeFactory.getNode(NodeTypes.COLUMN_REFERENCE,
-                                                    thirdName,
+                                                    names[2],
                                                     tableName,
                                                     new Integer(lastIdentifierToken.beginOffset),
                                                     new Integer(lastIdentifierToken.endOffset),
                                                     parserContext);
+    }
+}
+
+String[]
+groupIndexColumnNameComponents() throws StandardException :
+{
+    String[] names = new String[3];
+}
+{
+    names[0] = identifierDeferCheckLength()
+    [ LOOKAHEAD( { getToken(1).kind == PERIOD } )
+      <PERIOD>
+      names[1] = identifierDeferCheckLength()
+      [ LOOKAHEAD( { getToken(1).kind == PERIOD } )
+        <PERIOD>
+        names[2] = identifierDeferCheckLength() ] ]
+    {
+        if (names[1] == null) {
+            names[2] = names[0];
+            names[0] = null;
+        }
+        else if (names[2] == null) {
+            names[2] = names[1];
+            names[1] = names[0];
+            names[0] = null;
+        }
+        if (names[0] != null)
+            parserContext.checkIdentifierLengthLimit(names[0]);
+        if (names[1] != null)
+            parserContext.checkIdentifierLengthLimit(names[1]);
+        parserContext.checkIdentifierLengthLimit(names[2]);
+        return names;
     }
 }
